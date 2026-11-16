@@ -131,6 +131,29 @@ func TestPrepareBuildContextReplacesDockerfileSymlink(t *testing.T) {
 	}
 }
 
+func TestPrepareBuildContextRejectsDockerignoreSymlinks(t *testing.T) {
+	hostFile := filepath.Join(t.TempDir(), "host-file")
+	if err := os.WriteFile(hostFile, []byte("secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{".dockerignore", "Dockerfile.dockerignore"} {
+		t.Run(name, func(t *testing.T) {
+			archive := testTar(t, []tar.Header{{Name: name, Typeflag: tar.TypeSymlink, Linkname: hostFile, Mode: 0777}})
+			tempDir := t.TempDir()
+			if _, _, _, err := prepareBuildContext(tempDir, tempDir, "FROM scratch\n", archive); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("prepareBuildContext error = %v, want one naming %s", err, name)
+			}
+		})
+	}
+}
+
+func TestDockerBuildCommandRunsInTheBuildContext(t *testing.T) {
+	cmd := dockerBuildCommand(context.Background(), "kiln-vm-build-test:tag", "/tmp/context/Dockerfile", "/tmp/context", "")
+	if cmd.Dir != "/tmp/context" {
+		t.Fatalf("Dir = %q, want the build context", cmd.Dir)
+	}
+}
+
 func TestPrepareBuildContextWritesDockerfileIntoExtractedContext(t *testing.T) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)

@@ -73,7 +73,7 @@ func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, con
 
 	// docker build
 	slog.Info("building docker image", "tag", dockerTag)
-	cmd := exec.CommandContext(ctx, "docker", dockerBuildArgs(dockerTag, dockerfilePath, buildContext, b.targetPlatform)...)
+	cmd := dockerBuildCommand(ctx, dockerTag, dockerfilePath, buildContext, b.targetPlatform)
 	output := &tailWriter{limit: dockerBuildOutputTailBytes}
 	pinned := &pinnedFromWriter{}
 	cmd.Stdout = io.MultiWriter(os.Stdout, output, pinned)
@@ -143,6 +143,13 @@ func (b *Builder) CleanupStaging() {
 	_ = os.RemoveAll(filepath.Join(b.buildDir, "contexts"))
 }
 
+// A caller's Dockerfile.rego can read cwd:// files, so cwd must be the context.
+func dockerBuildCommand(ctx context.Context, dockerTag, dockerfilePath, buildContext, targetPlatform string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "docker", dockerBuildArgs(dockerTag, dockerfilePath, buildContext, targetPlatform)...)
+	cmd.Dir = buildContext
+	return cmd
+}
+
 func dockerBuildArgs(dockerTag, dockerfilePath, buildContext, targetPlatform string) []string {
 	args := []string{"build", "-t", dockerTag, "-f", dockerfilePath}
 	if strings.TrimSpace(targetPlatform) != "" {
@@ -180,6 +187,12 @@ func prepareBuildContext(imageDir, tempParent, dockerfile, contextArchive string
 		return "", "", nil, fmt.Errorf("open build context: %w", err)
 	}
 	defer root.Close()
+	for _, name := range []string{".dockerignore", "Dockerfile.dockerignore"} {
+		if info, err := root.Lstat(name); err == nil && !info.Mode().IsRegular() {
+			cleanup()
+			return "", "", nil, fmt.Errorf("invalid build context: %s must be a regular file", name)
+		}
+	}
 	if err := writeRootFile(root, "Dockerfile", []byte(dockerfile), 0640); err != nil {
 		cleanup()
 		return "", "", nil, err
