@@ -90,7 +90,7 @@ func main() {
 		}
 	}
 	builder.SetTargetPlatform(targetPlatform)
-	rootfsPath, err := builder.Build(
+	rootfsPath, _, err := builder.Build(
 		ctx,
 		uuid.NewString(),
 		"vm-profile-"+profile.Name,

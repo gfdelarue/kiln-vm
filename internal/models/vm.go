@@ -10,6 +10,8 @@ type VM struct {
 	GuestOS       string                  `json:"guest_os,omitempty"`
 	MachineID     string                  `json:"machine_id"`
 	ImageID       string                  `json:"image_id"`
+	Image         string                  `json:"image,omitempty"`
+	Labels        map[string]string       `json:"labels,omitempty"`
 	NetworkPolicy string                  `json:"network_policy,omitempty"`
 	State         MachineState            `json:"state"`
 	IP            string                  `json:"ip,omitempty"`
@@ -34,6 +36,8 @@ type VMRecord struct {
 	Profile    string
 	MachineID  string
 	ImageID    string
+	VMImage    string
+	Labels     map[string]string
 	DiskSizeMB int64
 	Power      VMPower
 	CreatedAt  time.Time
@@ -41,25 +45,29 @@ type VMRecord struct {
 }
 
 type CreateVMRequest struct {
-	Name          string         `json:"name"`
-	Profile       string         `json:"profile"`
-	NetworkPolicy string         `json:"network_policy,omitempty"`
-	CPU           *CPUConfig     `json:"cpu,omitempty"`
-	VCPUs         int            `json:"-"`
-	MemoryMB      int            `json:"memory_mb,omitempty"`
-	DiskSizeMB    int64          `json:"disk_size_mb,omitempty"`
-	Power         *VMPowerPolicy `json:"power,omitempty"`
+	Name          string            `json:"name"`
+	Profile       string            `json:"profile,omitempty"`
+	Image         string            `json:"image,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	NetworkPolicy string            `json:"network_policy,omitempty"`
+	CPU           *CPUConfig        `json:"cpu,omitempty"`
+	VCPUs         int               `json:"-"`
+	MemoryMB      int               `json:"memory_mb,omitempty"`
+	DiskSizeMB    int64             `json:"disk_size_mb,omitempty"`
+	Power         *VMPowerPolicy    `json:"power,omitempty"`
 }
 
 type VMCreatePlan struct {
-	Name                string        `json:"name"`
-	Profile             string        `json:"profile"`
-	NetworkPolicy       string        `json:"network_policy,omitempty"`
-	CPU                 CPUConfig     `json:"cpu"`
-	MemoryMB            int           `json:"memory_mb"`
-	DiskSizeMB          int64         `json:"disk_size_mb"`
-	Power               VMPowerPolicy `json:"power"`
-	ProfileCapabilities []string      `json:"profile_capabilities,omitempty"`
+	Name                string            `json:"name"`
+	Profile             string            `json:"profile"`
+	Image               string            `json:"image,omitempty"`
+	Labels              map[string]string `json:"labels,omitempty"`
+	NetworkPolicy       string            `json:"network_policy,omitempty"`
+	CPU                 CPUConfig         `json:"cpu"`
+	MemoryMB            int               `json:"memory_mb"`
+	DiskSizeMB          int64             `json:"disk_size_mb"`
+	Power               VMPowerPolicy     `json:"power"`
+	ProfileCapabilities []string          `json:"profile_capabilities,omitempty"`
 }
 
 type VMPowerMode string

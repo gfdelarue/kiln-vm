@@ -10,6 +10,8 @@ type Image struct {
 	SizeMB     int64     `json:"size_mb"`
 	RootfsPath string    `json:"-"`
 	CreatedAt  time.Time `json:"created_at"`
+	// Set only on the result of a Dockerfile build; never stored.
+	BaseImages map[string]string `json:"-"`
 }
 
 type BuildImageRequest struct {

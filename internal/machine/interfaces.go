@@ -21,6 +21,7 @@ type MachineService interface {
 	Upload(ctx context.Context, id, path string, mode uint32, size int64, reader io.Reader) error
 	DialShell(ctx context.Context, id string) (io.ReadWriteCloser, error)
 	DialForward(ctx context.Context, id string, port int) (io.ReadWriteCloser, error)
+	RootDiskPath(id string) (string, error)
 }
 
 func ExecuteBuffered(

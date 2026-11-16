@@ -10,9 +10,12 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/gfdelarue/kiln-vm/internal/apierr"
 	thirdparty "github.com/gfdelarue/kiln-vm/third_party"
 )
 
@@ -38,70 +41,87 @@ func NewBuilder(dataDir, agentBinPath string) *Builder {
 
 // Build creates an ext4 rootfs from a Dockerfile.
 // Steps: docker build -> docker create -> sparse ext4 -> mount -> streamed docker export + extract.
-func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, contextDir string, rootfsSizeMB int64) (string, error) {
+func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, contextDir string, rootfsSizeMB int64) (string, map[string]string, error) {
 	finalDir := filepath.Join(b.dataDir, "images", imageID)
 	if err := os.MkdirAll(filepath.Dir(finalDir), 0750); err != nil {
-		return "", fmt.Errorf("create image parent dir: %w", err)
+		return "", nil, fmt.Errorf("create image parent dir: %w", err)
 	}
 	if err := checkMaterializationPreflight(b.buildDir, rootfsSizeMB, b.minFreeMB); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	buildParent := filepath.Join(b.buildDir, "images", "staging")
 	if err := os.MkdirAll(buildParent, 0750); err != nil {
-		return "", fmt.Errorf("create image staging parent: %w", err)
+		return "", nil, fmt.Errorf("create image staging parent: %w", err)
 	}
 	contextParent := filepath.Join(b.buildDir, "contexts")
 	if err := os.MkdirAll(contextParent, 0750); err != nil {
-		return "", fmt.Errorf("create image build context parent: %w", err)
+		return "", nil, fmt.Errorf("create image build context parent: %w", err)
 	}
 	stagingDir, err := os.MkdirTemp(buildParent, imageID+"-")
 	if err != nil {
-		return "", fmt.Errorf("create image staging dir: %w", err)
+		return "", nil, fmt.Errorf("create image staging dir: %w", err)
 	}
 	defer os.RemoveAll(stagingDir)
 
 	dockerTag := fmt.Sprintf("kiln-vm-build-%s:%s", name, tag)
 
-	buildContext, dockerfilePath, cleanup, err := prepareBuildContext(stagingDir, contextParent, dockerfile, contextDir)
+	buildContext, _, cleanup, err := prepareBuildContext(stagingDir, contextParent, dockerfile, contextDir)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer cleanup()
 
 	// docker build
 	slog.Info("building docker image", "tag", dockerTag)
-	cmd := exec.CommandContext(ctx, "docker", dockerBuildArgs(dockerTag, dockerfilePath, buildContext, b.targetPlatform)...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd := dockerBuildCommand(ctx, dockerTag, buildContext, b.targetPlatform)
+	output := &tailWriter{limit: dockerBuildOutputTailBytes}
+	pinned := &pinnedFromWriter{}
+	cmd.Stdout = io.MultiWriter(os.Stdout, output, pinned)
+	cmd.Stderr = io.MultiWriter(os.Stderr, output, pinned)
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("docker build: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", nil, fmt.Errorf("docker build: %w", ctxErr)
+		}
+		return "", nil, &apierr.OperationError{
+			Code:     "docker_build_failed",
+			Phase:    "docker_build",
+			Resource: "image",
+			Action:   "build",
+			Diagnostics: []apierr.OperationDiagnostic{{
+				Category:    "docker_build",
+				Step:        "docker build",
+				StderrTail:  output.String(),
+				Remediation: "fix the Dockerfile or build context and retry",
+			}},
+			Err: fmt.Errorf("docker build: %w", err),
+		}
 	}
 	defer exec.Command("docker", "image", "rm", "-f", dockerTag).Run()
 
 	// docker create (don't start)
 	containerID, err := execOutputCtx(ctx, "docker", "create", dockerTag)
 	if err != nil {
-		return "", fmt.Errorf("docker create: %w", err)
+		return "", nil, fmt.Errorf("docker create: %w", err)
 	}
 	defer exec.Command("docker", "rm", "-f", containerID).Run()
 
 	// Materialize container rootfs into a sparse ext4 image without writing an intermediate tar.
 	stagedRootfsPath := filepath.Join(stagingDir, "rootfs.ext4")
 	if err := containerToExt4(ctx, containerID, stagedRootfsPath, rootfsSizeMB); err != nil {
-		return "", fmt.Errorf("container to ext4: %w", err)
+		return "", nil, fmt.Errorf("container to ext4: %w", err)
 	}
 
 	if err := injectRuntime(stagedRootfsPath, b.agentBinPath); err != nil {
-		return "", fmt.Errorf("inject runtime: %w", err)
+		return "", nil, fmt.Errorf("inject runtime: %w", err)
 	}
 
 	if err := promoteStagingDir(stagingDir, finalDir); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	rootfsPath := filepath.Join(finalDir, "rootfs.ext4")
 
 	slog.Info("image built", "id", imageID, "path", rootfsPath)
-	return rootfsPath, nil
+	return rootfsPath, resolveBaseImages(ctx, dockerfile, pinned.Pinned()), nil
 }
 
 func (b *Builder) SetBuildDir(buildDir string) {
@@ -121,6 +141,13 @@ func (b *Builder) SetTargetPlatform(platform string) {
 func (b *Builder) CleanupStaging() {
 	_ = os.RemoveAll(filepath.Join(b.buildDir, "images", "staging"))
 	_ = os.RemoveAll(filepath.Join(b.buildDir, "contexts"))
+}
+
+// A caller's Dockerfile.rego can read cwd:// files, so cwd must be the context.
+func dockerBuildCommand(ctx context.Context, dockerTag, buildContext, targetPlatform string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "docker", dockerBuildArgs(dockerTag, "Dockerfile", ".", targetPlatform)...)
+	cmd.Dir = buildContext
+	return cmd
 }
 
 func dockerBuildArgs(dockerTag, dockerfilePath, buildContext, targetPlatform string) []string {
@@ -154,13 +181,24 @@ func prepareBuildContext(imageDir, tempParent, dockerfile, contextArchive string
 		return "", "", nil, err
 	}
 
-	dockerfilePath := filepath.Join(buildContext, "Dockerfile")
-	if err := os.WriteFile(dockerfilePath, []byte(dockerfile), 0640); err != nil {
+	root, err := os.OpenRoot(buildContext)
+	if err != nil {
 		cleanup()
-		return "", "", nil, fmt.Errorf("write Dockerfile: %w", err)
+		return "", "", nil, fmt.Errorf("open build context: %w", err)
+	}
+	defer root.Close()
+	for _, name := range []string{".dockerignore", "Dockerfile.dockerignore"} {
+		if info, err := root.Lstat(name); err == nil && !info.Mode().IsRegular() {
+			cleanup()
+			return "", "", nil, fmt.Errorf("invalid build context: %s must be a regular file", name)
+		}
+	}
+	if err := writeRootFile(root, "Dockerfile", []byte(dockerfile), 0640); err != nil {
+		cleanup()
+		return "", "", nil, err
 	}
 
-	return buildContext, dockerfilePath, cleanup, nil
+	return buildContext, filepath.Join(buildContext, "Dockerfile"), cleanup, nil
 }
 
 func unpackBase64Tar(encoded, targetDir string) error {
@@ -168,6 +206,11 @@ func unpackBase64Tar(encoded, targetDir string) error {
 	if err != nil {
 		return fmt.Errorf("decode build context: %w", err)
 	}
+	root, err := os.OpenRoot(targetDir)
+	if err != nil {
+		return fmt.Errorf("open build context: %w", err)
+	}
+	defer root.Close()
 
 	tr := tar.NewReader(bytes.NewReader(data))
 	for {
@@ -179,21 +222,28 @@ func unpackBase64Tar(encoded, targetDir string) error {
 			return fmt.Errorf("read build context: %w", err)
 		}
 
-		targetPath := filepath.Join(targetDir, filepath.Clean(header.Name))
-		if !isWithin(targetDir, targetPath) {
+		name := filepath.Clean(header.Name)
+		if !filepath.IsLocal(name) {
 			return fmt.Errorf("invalid build context path: %s", header.Name)
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(targetPath, 0750); err != nil {
+			if err := root.MkdirAll(name, 0750); err != nil {
 				return fmt.Errorf("create context dir: %w", err)
 			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0750); err != nil {
+		case tar.TypeSymlink:
+			if err := root.MkdirAll(filepath.Dir(name), 0750); err != nil {
 				return fmt.Errorf("create context parent dir: %w", err)
 			}
-			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode))
+			if err := root.Symlink(header.Linkname, name); err != nil {
+				return fmt.Errorf("create context symlink: %w", err)
+			}
+		case tar.TypeReg:
+			if err := root.MkdirAll(filepath.Dir(name), 0750); err != nil {
+				return fmt.Errorf("create context parent dir: %w", err)
+			}
+			f, err := root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
 			if err != nil {
 				return fmt.Errorf("create context file: %w", err)
 			}
@@ -206,14 +256,6 @@ func unpackBase64Tar(encoded, targetDir string) error {
 			}
 		}
 	}
-}
-
-func isWithin(root, path string) bool {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && filepath.Dir(rel) != ".."
 }
 
 func containerToExt4(ctx context.Context, containerID, ext4Path string, sizeMB int64) error {
@@ -265,75 +307,124 @@ func injectRuntime(rootfsPath, agentBinPath string) error {
 	mountDir := rootfsPath + ".mount"
 	os.MkdirAll(mountDir, 0750)
 
-	if out, err := exec.Command("mount", "-o", "loop", rootfsPath, mountDir).CombinedOutput(); err != nil {
+	if out, err := exec.Command("mount", "-o", "loop,nodev,nosuid,noexec", rootfsPath, mountDir).CombinedOutput(); err != nil {
 		return fmt.Errorf("mount: %s: %w", out, err)
 	}
 	defer cleanupMountedRootfsDir(mountDir, rootfsPath)
 
-	if err := os.MkdirAll(filepath.Join(mountDir, "sbin"), 0755); err != nil {
-		return fmt.Errorf("create sbin dir: %w", err)
+	root, err := os.OpenRoot(mountDir)
+	if err != nil {
+		return fmt.Errorf("open rootfs: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(mountDir, "sbin", "kiln-vm-init"), []byte(initScript), 0755); err != nil {
-		return fmt.Errorf("write kiln-vm-init: %w", err)
-	}
-
-	if err := injectAgentBinary(mountDir, agentBinPath); err != nil {
-		return err
-	}
-
-	if err := ensureOpenSSHHostKeys(mountDir); err != nil {
-		return err
-	}
-
-	return nil
+	defer root.Close()
+	return writeRuntime(root, agentBinPath)
 }
 
-func injectAgentBinary(mountDir, agentBinPath string) error {
+func writeRuntime(root *os.Root, agentBinPath string) error {
 	if agentBinPath == "" {
 		return fmt.Errorf("kiln-vm agent path is not configured")
 	}
-
 	agentBytes, err := os.ReadFile(agentBinPath)
 	if err != nil {
 		return fmt.Errorf("read kiln-vm-agent binary: %w", err)
 	}
 
-	targetPath := filepath.Join(mountDir, "sbin", "kiln-vm-agent")
-	if err := os.WriteFile(targetPath, agentBytes, 0755); err != nil {
+	if err := root.MkdirAll("sbin", 0755); err != nil {
+		return fmt.Errorf("create sbin dir: %w", err)
+	}
+	if err := writeRootFile(root, "sbin/kiln-vm-init", []byte(initScript), 0755); err != nil {
+		return fmt.Errorf("write kiln-vm-init: %w", err)
+	}
+	if err := writeRootFile(root, "sbin/kiln-vm-agent", agentBytes, 0755); err != nil {
 		return fmt.Errorf("write kiln-vm-agent: %w", err)
 	}
 
-	licensePath := filepath.Join(mountDir, filepath.FromSlash(thirdparty.GoXNetGuestLicensePath))
-	if err := os.MkdirAll(filepath.Dir(licensePath), 0755); err != nil {
+	licensePath := thirdparty.GoXNetGuestLicensePath
+	if err := root.MkdirAll(path.Dir(licensePath), 0755); err != nil {
 		return fmt.Errorf("create kiln-vm-agent third-party notice dir: %w", err)
 	}
-	if err := os.WriteFile(licensePath, thirdparty.GoXNetLicense(), 0444); err != nil {
+	if err := writeRootFile(root, licensePath, thirdparty.GoXNetLicense(), 0444); err != nil {
 		return fmt.Errorf("write kiln-vm-agent golang.org/x/net notice: %w", err)
 	}
-	if err := os.Chmod(licensePath, 0444); err != nil {
+	if err := root.Chmod(licensePath, 0444); err != nil {
 		return fmt.Errorf("set kiln-vm-agent golang.org/x/net notice permissions: %w", err)
+	}
+
+	return ensureOpenSSHHostKeys(root)
+}
+
+func writeRootFile(root *os.Root, name string, data []byte, perm os.FileMode) error {
+	info, err := root.Lstat(name)
+	if err == nil && !info.Mode().IsRegular() {
+		if err := root.Remove(name); err != nil {
+			return fmt.Errorf("replace %s: %w", info.Mode().Type(), err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+	if err := root.WriteFile(name, data, perm); err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
 	}
 	return nil
 }
 
-func ensureOpenSSHHostKeys(mountDir string) error {
-	sshdPath := filepath.Join(mountDir, "usr", "sbin", "sshd")
-	sshKeygenPath := filepath.Join(mountDir, "usr", "bin", "ssh-keygen")
-	if _, err := os.Stat(sshdPath); err != nil {
+func ensureOpenSSHHostKeys(root *os.Root) error {
+	if _, err := root.Stat("usr/sbin/sshd"); err != nil {
 		return nil
 	}
-	if _, err := os.Stat(sshKeygenPath); err != nil {
+	if _, err := root.Stat("usr/bin/ssh-keygen"); err != nil {
 		return nil
 	}
 
-	if err := os.MkdirAll(filepath.Join(mountDir, "etc", "ssh"), 0755); err != nil {
-		return fmt.Errorf("create ssh config dir: %w", err)
+	scratch, err := os.MkdirTemp("", "kiln-vm-ssh-host-keys-*")
+	if err != nil {
+		return fmt.Errorf("create ssh host key dir: %w", err)
 	}
-
-	if out, err := exec.Command("ssh-keygen", "-A", "-f", mountDir).CombinedOutput(); err != nil {
+	defer os.RemoveAll(scratch)
+	keyDir := filepath.Join(scratch, "etc", "ssh")
+	if err := os.MkdirAll(keyDir, 0755); err != nil {
+		return fmt.Errorf("create ssh host key dir: %w", err)
+	}
+	if out, err := exec.Command("ssh-keygen", "-A", "-f", scratch).CombinedOutput(); err != nil {
 		return fmt.Errorf("generate openssh host keys: %s: %w", out, err)
 	}
+
+	if err := root.MkdirAll("etc/ssh", 0755); err != nil {
+		return fmt.Errorf("create ssh config dir: %w", err)
+	}
+	keys, err := os.ReadDir(keyDir)
+	if err != nil {
+		return fmt.Errorf("read generated ssh host keys: %w", err)
+	}
+	for _, key := range keys {
+		private := key.Name()
+		if strings.HasSuffix(private, ".pub") {
+			continue
+		}
+		if _, err := root.Lstat("etc/ssh/" + private); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect ssh host key: %w", err)
+		}
+		for _, name := range []string{private, private + ".pub"} {
+			if err := copyIntoRoot(root, filepath.Join(keyDir, name), "etc/ssh/"+name); err != nil {
+				return fmt.Errorf("install ssh host key: %w", err)
+			}
+		}
+	}
 	return nil
+}
+
+func copyIntoRoot(root *os.Root, src, name string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", src, err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", src, err)
+	}
+	return writeRootFile(root, name, data, info.Mode().Perm())
 }
 
 const initScript = `#!/bin/sh
@@ -441,4 +532,28 @@ func execOutputCtx(ctx context.Context, name string, args ...string) (string, er
 		s = s[:len(s)-1]
 	}
 	return s, nil
+}
+
+const dockerBuildOutputTailBytes = 8 * 1024
+
+type tailWriter struct {
+	mu    sync.Mutex
+	limit int
+	buf   []byte
+}
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.limit {
+		w.buf = append(w.buf[:0], w.buf[len(w.buf)-w.limit:]...)
+	}
+	return len(p), nil
+}
+
+func (w *tailWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
 }

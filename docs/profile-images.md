@@ -4,6 +4,10 @@ A profile image is the root filesystem a new VM starts from. kiln-vm caches one
 image per profile, profile version and disk size, and copies it into each new
 VM. Deleting a VM leaves the cached image in place.
 
+Profile images are a cache that kiln-vm manages. To keep a disk of your own and
+create VMs from it, save or build a [VM image](vms.md#save-and-build-vm-images)
+instead.
+
 ## Where images come from
 
 `KILN_VM_PROFILE_IMAGE_MODE` picks the source:

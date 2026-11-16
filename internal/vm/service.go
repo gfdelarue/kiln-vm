@@ -51,6 +51,11 @@ type Store interface {
 	ListVMProfileImages() ([]models.VMProfileImage, error)
 	DeleteVMProfileImage(id string) error
 	DeleteVMProfileImagesByProfile(profile string) ([]models.VMProfileImage, error)
+	CreateVMImage(img *models.VMImage) error
+	GetVMImage(ref string) (*models.VMImage, error)
+	GetVMImageByImageID(imageID string) (*models.VMImage, error)
+	ListVMImages() ([]models.VMImage, error)
+	DeleteVMImage(id string) error
 }
 
 type ImageService interface {
@@ -70,6 +75,8 @@ type Service struct {
 	powerMu                 sync.Mutex
 	powerLeases             map[string]int
 	powerStopping           map[string]bool
+	powerStarting           map[string]int
+	savingImage             map[string]bool
 	profileImages           ProfileImageSource
 	catalog                 *ProfileImageCatalog
 	ociHTTPClient           *http.Client
@@ -147,6 +154,8 @@ func NewService(db Store, images ImageService, machines machine.MachineService) 
 		maxDiskSizeMB:           DefaultMaxDiskSizeMB,
 		powerLeases:             map[string]int{},
 		powerStopping:           map[string]bool{},
+		powerStarting:           map[string]int{},
+		savingImage:             map[string]bool{},
 		profileImages:           ProfileImageSource{Mode: ProfileImageModeLocal},
 		pullTimeout:             image.DefaultOCIPullTimeout,
 		pullStallTimeout:        image.DefaultOCIPullStallTimeout,
@@ -848,6 +857,11 @@ func (s *Service) deleteSupersededProfileImages(current *models.VMProfileImage) 
 }
 
 func (s *Service) deleteImageIfUnused(imageID string) error {
+	if _, err := s.db.GetVMImageByImageID(imageID); err == nil {
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("check vm image ownership: %w", err)
+	}
 	count, err := s.db.CountVMsByImageID(imageID)
 	if err != nil {
 		return fmt.Errorf("count vms using image: %w", err)
@@ -883,12 +897,9 @@ func (s *Service) Create(ctx context.Context, req *models.CreateVMRequest) (*mod
 	plan := resolved.plan
 	profile := s.applyProfileInfrastructureConfig(resolved.profile)
 
-	baseImage, err := s.EnsureProfileImage(ctx, &models.EnsureVMProfileImageRequest{
-		Profile:      profile.Name,
-		RootfsSizeMB: plan.DiskSizeMB,
-	})
+	imageID, rootfsSizeMB, err := s.resolveCreateImage(ctx, resolved, profile)
 	if err != nil {
-		return nil, fmt.Errorf("ensure vm profile image: %w", err)
+		return nil, err
 	}
 
 	machineCreated := false
@@ -897,10 +908,11 @@ func (s *Service) Create(ctx context.Context, req *models.CreateVMRequest) (*mod
 		Backend:       profile.Backend,
 		GuestOS:       profile.GuestOS,
 		Libvirt:       libvirtdomain.Clone(profile.Libvirt),
-		ImageID:       baseImage.ImageID,
+		ImageID:       imageID,
 		NetworkPolicy: plan.NetworkPolicy,
 		CPU:           &plan.CPU,
 		MemoryMB:      plan.MemoryMB,
+		RootfsSizeMB:  rootfsSizeMB,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create vm machine: %w", err)
@@ -913,7 +925,9 @@ func (s *Service) Create(ctx context.Context, req *models.CreateVMRequest) (*mod
 		Name:       plan.Name,
 		Profile:    profile.Name,
 		MachineID:  m.ID,
-		ImageID:    baseImage.ImageID,
+		ImageID:    imageID,
+		VMImage:    plan.Image,
+		Labels:     plan.Labels,
 		DiskSizeMB: plan.DiskSizeMB,
 		Power: models.VMPower{
 			Policy:         plan.Power,
@@ -943,6 +957,20 @@ func (s *Service) Create(ctx context.Context, req *models.CreateVMRequest) (*mod
 	return s.composeWithMachine(record, m)
 }
 
+func (s *Service) resolveCreateImage(ctx context.Context, resolved *resolvedVMCreatePlan, profile Profile) (string, int64, error) {
+	if resolved.image != nil {
+		return resolved.image.ImageID, resolved.plan.DiskSizeMB, nil
+	}
+	baseImage, err := s.EnsureProfileImage(ctx, &models.EnsureVMProfileImageRequest{
+		Profile:      profile.Name,
+		RootfsSizeMB: resolved.plan.DiskSizeMB,
+	})
+	if err != nil {
+		return "", 0, fmt.Errorf("ensure vm profile image: %w", err)
+	}
+	return baseImage.ImageID, 0, nil
+}
+
 func (s *Service) Get(ref string) (*models.VM, error) {
 	record, err := s.getRecord(ref)
 	if err != nil {
@@ -951,13 +979,16 @@ func (s *Service) Get(ref string) (*models.VM, error) {
 	return s.compose(record)
 }
 
-func (s *Service) List() ([]models.VM, error) {
+func (s *Service) List(selectors ...LabelSelector) ([]models.VM, error) {
 	records, err := s.db.ListVMs()
 	if err != nil {
 		return nil, fmt.Errorf("list vms: %w", err)
 	}
 	vms := make([]models.VM, 0, len(records))
 	for _, record := range records {
+		if !MatchLabels(record.Labels, selectors) {
+			continue
+		}
 		composed, err := s.compose(&record)
 		if err != nil {
 			if errors.Is(err, apierr.ErrNotFound) {
@@ -975,6 +1006,11 @@ func (s *Service) Start(ctx context.Context, ref string) (*models.VM, error) {
 	if err != nil {
 		return nil, err
 	}
+	releaseStart, err := s.reserveStart(record)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseStart()
 	m, err := s.machines.Get(record.MachineID)
 	if err != nil {
 		return nil, fmt.Errorf("get vm machine: %w", err)
@@ -1187,6 +1223,9 @@ func (s *Service) Delete(ref string) error {
 	record, err := s.getRecord(ref)
 	if err != nil {
 		return err
+	}
+	if s.isSavingImage(record.ID) {
+		return fmt.Errorf("VM %q is being saved as an image: %w", record.Name, apierr.ErrConflict)
 	}
 
 	if err := s.machines.Delete(record.MachineID); err != nil {
@@ -1552,6 +1591,8 @@ func composeVM(record *models.VMRecord, m *models.Machine) *models.VM {
 		GuestOS:       m.GuestOS,
 		MachineID:     record.MachineID,
 		ImageID:       record.ImageID,
+		Image:         record.VMImage,
+		Labels:        record.Labels,
 		NetworkPolicy: m.NetworkPolicy,
 		State:         m.State,
 		IP:            m.IP,

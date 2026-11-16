@@ -13,6 +13,7 @@ import (
 type resolvedVMCreatePlan struct {
 	plan    *models.VMCreatePlan
 	profile Profile
+	image   *models.VMImage
 }
 
 func (s *Service) PlanCreate(req *models.CreateVMRequest) (*models.VMCreatePlan, error) {
@@ -37,17 +38,45 @@ func (s *Service) resolveCreatePlan(req *models.CreateVMRequest) (*resolvedVMCre
 		return nil, fmt.Errorf("check vm name: %w", err)
 	}
 
-	profile, err := getProfile(strings.TrimSpace(req.Profile))
+	if err := ValidateLabels("labels", req.Labels); err != nil {
+		return nil, err
+	}
+
+	profileName := strings.TrimSpace(req.Profile)
+	imageRef := strings.TrimSpace(req.Image)
+	var vmImage *models.VMImage
+	if imageRef != "" {
+		if profileName != "" {
+			return nil, &apierr.ValidationError{Field: "image", Message: "cannot be combined with profile; set image or profile, not both"}
+		}
+		resolvedImage, err := s.resolveVMImage(imageRef)
+		if err != nil {
+			if errors.Is(err, apierr.ErrNotFound) {
+				return nil, &apierr.ValidationError{Field: "image", Message: fmt.Sprintf("VM image %q not found", imageRef)}
+			}
+			return nil, err
+		}
+		vmImage = resolvedImage
+		profileName = vmImage.Profile
+	}
+
+	profile, err := getProfile(profileName)
 	if err != nil {
 		return nil, &apierr.ValidationError{Field: "profile", Message: err.Error()}
 	}
 
 	diskSizeMB := profile.DefaultDiskSizeMB
+	if vmImage != nil {
+		diskSizeMB = vmImage.DiskSizeMB
+	}
 	if req.DiskSizeMB != 0 {
 		diskSizeMB = req.DiskSizeMB
 	}
 	if err := s.validateDiskSizeMB("disk_size_mb", diskSizeMB); err != nil {
 		return nil, err
+	}
+	if vmImage != nil && diskSizeMB < vmImage.DiskSizeMB {
+		return nil, &apierr.ValidationError{Field: "disk_size_mb", Message: fmt.Sprintf("must be at least %d, the size of VM image %q", vmImage.DiskSizeMB, vmImage.Name)}
 	}
 
 	cpu := models.CPUConfig{Kind: "shared", VCPUs: profile.DefaultVCPUs}
@@ -84,6 +113,7 @@ func (s *Service) resolveCreatePlan(req *models.CreateVMRequest) (*resolvedVMCre
 	plan := &models.VMCreatePlan{
 		Name:                name,
 		Profile:             profile.Name,
+		Labels:              normalizeLabels(req.Labels),
 		NetworkPolicy:       req.NetworkPolicy,
 		CPU:                 cpu,
 		MemoryMB:            memoryMB,
@@ -91,5 +121,8 @@ func (s *Service) resolveCreatePlan(req *models.CreateVMRequest) (*resolvedVMCre
 		Power:               powerPolicy,
 		ProfileCapabilities: append([]string(nil), profile.Capabilities...),
 	}
-	return &resolvedVMCreatePlan{plan: plan, profile: profile}, nil
+	if vmImage != nil {
+		plan.Image = vmImage.Name
+	}
+	return &resolvedVMCreatePlan{plan: plan, profile: profile, image: vmImage}, nil
 }

@@ -2056,6 +2056,10 @@ func (s *roleCreateMachineService) DialShell(context.Context, string) (io.ReadWr
 	panic("not used")
 }
 
+func (s *roleCreateMachineService) RootDiskPath(string) (string, error) {
+	return "", errors.New("root disk path should not be called")
+}
+
 func (s *roleCreateMachineService) DialForward(context.Context, string, int) (io.ReadWriteCloser, error) {
 	panic("not used")
 }
@@ -2124,6 +2128,10 @@ func (s *powerMachineService) DialShell(context.Context, string) (io.ReadWriteCl
 	panic("not used")
 }
 
+func (s *powerMachineService) RootDiskPath(string) (string, error) {
+	return "", errors.New("root disk path should not be called")
+}
+
 func (s *powerMachineService) DialForward(context.Context, string, int) (io.ReadWriteCloser, error) {
 	panic("not used")
 }
@@ -2180,6 +2188,10 @@ func (s *readinessMachineService) Upload(context.Context, string, string, uint32
 
 func (s *readinessMachineService) DialShell(context.Context, string) (io.ReadWriteCloser, error) {
 	panic("not used")
+}
+
+func (s *readinessMachineService) RootDiskPath(string) (string, error) {
+	return "", errors.New("root disk path should not be called")
 }
 
 func (s *readinessMachineService) DialForward(_ context.Context, _ string, port int) (io.ReadWriteCloser, error) {

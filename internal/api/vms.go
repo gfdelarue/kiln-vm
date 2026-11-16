@@ -121,7 +121,12 @@ func (h *VMHandler) PlanCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *VMHandler) List(w http.ResponseWriter, r *http.Request) {
-	vms, err := h.service.List()
+	selectors, err := vmservice.ParseLabelSelectors(r.URL.Query()["label"])
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	vms, err := h.service.List(selectors...)
 	if err != nil {
 		writeServiceError(w, err)
 		return

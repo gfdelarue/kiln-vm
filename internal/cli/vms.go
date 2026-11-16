@@ -65,8 +65,9 @@ var vmListCmd = &cobra.Command{
 			return err
 		}
 		jsonOutput, _ := cmd.Flags().GetBool("json")
+		selectors, _ := cmd.Flags().GetStringArray("label")
 		var vms []models.VM
-		if err := c.Get("/vms", &vms); err != nil {
+		if err := c.Get(withLabelQuery("/vms", selectors), &vms); err != nil {
 			return err
 		}
 		if jsonOutput {
@@ -128,6 +129,7 @@ var vmCreateCmd = &cobra.Command{
 
 func parseVMCreateCommand(cmd *cobra.Command, name string) (models.CreateVMRequest, bool, bool, error) {
 	profile, _ := cmd.Flags().GetString("profile")
+	imageRef, _ := cmd.Flags().GetString("image")
 	disk, _ := cmd.Flags().GetString("disk")
 	networkPolicy, _ := cmd.Flags().GetString("network-policy")
 	cpuFlag, _ := cmd.Flags().GetString("cpu")
@@ -141,6 +143,10 @@ func parseVMCreateCommand(cmd *cobra.Command, name string) (models.CreateVMReque
 		return models.CreateVMRequest{}, false, false, err
 	}
 	diskSizeMB, err := parseDiskMB(disk)
+	if err != nil {
+		return models.CreateVMRequest{}, false, false, err
+	}
+	labels, err := labelFlags(cmd)
 	if err != nil {
 		return models.CreateVMRequest{}, false, false, err
 	}
@@ -160,6 +166,8 @@ func parseVMCreateCommand(cmd *cobra.Command, name string) (models.CreateVMReque
 	return models.CreateVMRequest{
 		Name:          name,
 		Profile:       profile,
+		Image:         imageRef,
+		Labels:        labels,
 		NetworkPolicy: networkPolicy,
 		CPU:           cpu,
 		MemoryMB:      memoryMB,
@@ -498,6 +506,9 @@ func init() {
 		cmd.Flags().Bool("json", false, "Print JSON output")
 	}
 	vmCreateCmd.Flags().String("profile", "", "VM profile (server default when omitted)")
+	vmCreateCmd.Flags().String("image", "", "VM image to create the VM from, instead of --profile")
+	vmCreateCmd.Flags().StringArray("label", nil, "Label as key=value; repeat for more labels")
+	vmListCmd.Flags().StringArray("label", nil, "Show VMs with this label, as key=value or key; repeat to require all")
 	vmCreateCmd.Flags().String("disk", "", "Root disk size in MiB, or with M/G suffix")
 	vmCreateCmd.Flags().String("network-policy", "", "Network policy: isolated-web restricts guests to public HTTP/HTTPS and gateway DNS")
 	vmCreateCmd.Flags().String("cpu", "", "CPU allocation (for example 1, 0.25, or 250m; profile default when omitted)")
