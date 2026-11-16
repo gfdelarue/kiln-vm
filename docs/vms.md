@@ -35,6 +35,70 @@ can take a few minutes. Later VMs copy the cached image. To pay that cost ahead
 of time, run `kiln-vm images ensure <profile> --disk <size>`.
 [Profile images](profile-images.md) covers the cache.
 
+## Label a VM
+
+Labels are key-value pairs that tools use to find their own VMs:
+
+```bash
+kiln-vm create job-42 --profile alpine --label owner=kiln-run --label job=42
+kiln-vm list --label owner=kiln-run
+kiln-vm list --label owner=kiln-run --label job
+```
+
+A `--label` filter on `kiln-vm list` is either `key=value` or `key`. A bare key
+matches any VM that has that label. Repeated filters must all match.
+
+A key is 1 to 63 characters of lowercase letters, digits, `.`, `_`, `/` and
+`-`. It starts and ends with a letter or a digit. A value is at most 255 bytes.
+A VM has at most 32 labels. kiln-vm stores labels in its database, so they
+survive restarts. You set labels when you create the VM and cannot change them
+later.
+
+## Save and build VM images
+
+A VM image is a root disk you can create new VMs from. It is separate from the
+cached [profile images](profile-images.md). You can save one from a stopped VM
+or build one from a Dockerfile:
+
+```bash
+kiln-vm stop dev
+kiln-vm vm-images save dev dev-snapshot
+kiln-vm vm-images build tools -f Dockerfile --context . --label owner=kiln-run
+kiln-vm vm-images list --label owner=kiln-run
+kiln-vm vm-images get tools
+kiln-vm vm-images delete dev-snapshot
+```
+
+`vm-images save` copies the VM's root disk. The VM must be stopped. The image
+keeps the VM's profile and disk size. Only Firecracker VMs can be saved. A
+saved image holds everything on the VM's disk, including its SSH host keys and
+any credentials you put there. VMs created from it share those files.
+
+`vm-images build` runs `docker build` on the host. The context directory is
+sent to `kiln-vmd` as a tar archive of at most 96 MiB. `--profile` picks the
+Firecracker Linux profile that VMs from the image use. It defaults to `debian`.
+`--disk` defaults to the profile's disk size. kiln-vm adds its guest agent and
+init to the built filesystem, as it does for profile images. A build stops
+when the client disconnects or after `KILN_VM_IMAGE_BUILD_TIMEOUT`, which
+defaults to 30 minutes. When the base images of the Dockerfile's `FROM` lines are present
+in the host's Docker cache, the image records their repository digests in
+`resolved`.
+
+Create a VM from an image with `--image` instead of `--profile`:
+
+```bash
+kiln-vm create dev2 --image dev-snapshot
+kiln-vm create big --image tools --disk 64G
+```
+
+The VM uses the image's profile. Its disk defaults to the image's size and
+cannot be smaller. `kiln-vm list` and `kiln-vm get` show the image a VM came
+from.
+
+`kiln-vm vm-images delete` always removes the image from the list. Each VM has
+its own copy of the disk, so VMs created from the image keep working. kiln-vm
+deletes the image's disk file when the last of those VMs is deleted.
+
 ## Use a VM
 
 Run a command. A single argument runs as a shell command line. Several
@@ -128,7 +192,8 @@ kiln-vm delete dev
 
 `kiln-vm stop` asks the guest to sync and power off. If the guest does not stop
 in time, kiln-vm ends the VM process. `kiln-vm delete` removes the VM and its
-root disk. It keeps the cached profile image.
+root disk. It keeps the cached profile image and any VM image the VM came
+from.
 
 ## Restrict network access
 
@@ -244,6 +309,33 @@ pool. The cgroup `/sys/fs/cgroup/kiln-vm/pool` enforces the pool's quota. The
 pool counts against `KILN_VM_MAX_TOTAL_VCPUS` once, whatever the number of VMs
 in it. `KILN_VM_POOLED_CPU_LIMIT` defaults to 0, which turns pooling off, and
 cannot exceed `KILN_VM_MAX_TOTAL_VCPUS`.
+
+## HTTP API
+
+The CLI wraps the HTTP API. Every route needs the bearer token. The routes for
+labels and VM images are:
+
+| Route | Body or query | Result |
+| --- | --- | --- |
+| `POST /vms` | `labels`, and `image` as an alternative to `profile` | The VM, with `labels` and `image` |
+| `GET /vms` | `label=key=value` or `label=key`, repeatable | VMs that match every filter |
+| `GET /vms/{ref}` | | The VM, with `labels` and `image` |
+| `POST /vm-images` | `{name, from_vm, labels}` or `{name, dockerfile, context, profile, disk_size_mb, labels}` | `201` and the image |
+| `GET /vm-images` | `label`, as for `GET /vms` | Images that match every filter |
+| `GET /vm-images/{ref}` | | The image |
+| `DELETE /vm-images/{ref}` | | `204` |
+
+`context` is a base64-encoded tar archive. A VM image has the fields `id`,
+`name`, `profile`, `source` (`vm` or `dockerfile`), `disk_size_mb`, `labels`,
+`created_at`, and `resolved` when known. `resolved` maps each `FROM` reference
+to its repository digest. A `{ref}` is a name, an ID, or a unique ID prefix of
+at least 4 characters. Responses omit `labels` and `image` when they are empty.
+
+Invalid labels or filters, an unknown image, and a request that sets both or
+neither of `from_vm` and `dockerfile` return `400`. Saving a VM that is not
+stopped returns `409`. A failed `docker build` returns `500` with the code
+`docker_build_failed` and the end of the build output in
+`diagnostics[0].stderr_tail`.
 
 ## Limits
 

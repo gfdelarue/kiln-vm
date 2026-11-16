@@ -120,12 +120,22 @@ kiln-vm start box
 kiln-vm delete box
 ```
 
-[VMs](docs/vms.md) is the full reference for profiles, power modes, networking
-and guest access.
+Save a stopped VM as an image, or build one from a Dockerfile, and create VMs
+from it:
+
+```bash
+kiln-vm vm-images save box box-image
+kiln-vm vm-images build tools -f Dockerfile --context .
+kiln-vm create box2 --image box-image --label owner=me
+```
+
+[VMs](docs/vms.md) is the full reference for profiles, power modes, networking,
+labels, VM images and guest access.
 
 ## Documentation
 
-- [VMs](docs/vms.md): lifecycle, profiles, power, networking and guest access.
+- [VMs](docs/vms.md): lifecycle, profiles, labels, VM images, power, networking
+  and guest access.
 - [Operator guide](docs/operator-guide.md): configuration, storage, metrics,
   upgrades and troubleshooting.
 - [Management transport and TLS](docs/tls-setup.md): local, HTTPS and
