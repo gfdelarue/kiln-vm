@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  regression:
+    name: Default Testkit projects and Go checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Testkit
+        run: npm ci --no-audit --no-fund
+
+      - name: Run the default Testkit projects
+        id: testkit
+        run: npx testkit run
+
+      - name: Check Go formatting
+        if: ${{ !cancelled() && steps.testkit.outcome != 'skipped' }}
+        run: |
+          unformatted=$(gofmt -l cmd internal third_party)
+          if [ -n "$unformatted" ]; then
+            echo "Files not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet Go packages
+        if: ${{ !cancelled() && steps.testkit.outcome != 'skipped' }}
+        run: go vet ./...
+
+      - name: Compile tagged system tests
+        if: ${{ !cancelled() && steps.testkit.outcome != 'skipped' }}
+        run: |
+          npx testkit typecheck --go-project network-service
+          go vet -tags='system' ./internal/systemtest
+          go vet -tags='system privileged service' ./internal/systemtest
+          go vet -tags='system distro' ./internal/systemtest
+          go vet -tags='system windowsprofile' ./internal/systemtest
+
+      - name: Seal interrupted Testkit results
+        if: always() && steps.testkit.outcome != 'skipped'
+        run: npx testkit cleanup
+
+      - name: Report the run to GitHub
+        if: always()
+        continue-on-error: ${{ github.event.pull_request.head.repo.fork == true }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npx testkit ci report
+
+      - name: Upload Testkit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testkit-results
+          path: .testkit/results
+          include-hidden-files: true
+          if-no-files-found: ignore

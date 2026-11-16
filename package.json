@@ -1,0 +1,9 @@
+{
+  "name": "kiln-vm",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "devDependencies": {
+    "@gfdelarue/testkit": "0.12.3"
+  }
+}

@@ -1,0 +1,64 @@
+version: '3'
+
+tasks:
+  run:
+    desc: Build and run kiln-vmd
+    cmds:
+      - go build -o bin/kiln-vmd ./cmd/kiln-vmd
+      - ./bin/kiln-vmd
+
+  package:deb:
+    desc: Build the Debian package
+    cmds:
+      - node scripts/build-deb.mjs
+
+  ci:
+    desc: Run the checks CI runs
+    cmds:
+      - task: fmt:check
+      - go vet ./...
+      - go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+      - golangci-lint run ./...
+      - npx testkit run
+      - task: typecheck:system
+      - task: build
+
+  fmt:check:
+    cmds:
+      - bash -c 'UNFORMATTED=$(gofmt -l cmd internal third_party); if [ -n "$UNFORMATTED" ]; then echo "Files not formatted:"; echo "$UNFORMATTED"; exit 1; fi'
+
+  typecheck:system:
+    desc: Compile every tag combination of the system tests without running them
+    cmds:
+      - npx testkit typecheck --go-project network-service
+      - go vet -tags='system' ./internal/systemtest
+      - go vet -tags='system privileged service' ./internal/systemtest
+      - go vet -tags='system distro' ./internal/systemtest
+      - go vet -tags='system windowsprofile' ./internal/systemtest
+
+  build:
+    desc: Build the binaries into bin/
+    cmds:
+      - go build -o bin/kiln-vmd ./cmd/kiln-vmd
+      - go build -o bin/kiln-vm ./cmd/kiln-vm
+      - go build -o bin/kiln-vm-profile-artifact ./cmd/kiln-vm-profile-artifact
+      - bash -c 'CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/kiln-vm-agent-amd64 ./cmd/kiln-vm-agent'
+      - bash -c 'CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/kiln-vm-agent-arm64 ./cmd/kiln-vm-agent'
+
+  ci:nix:
+    desc: Evaluate and build the Nix outputs
+    cmds:
+      - npx testkit run --file-timeout-seconds 3600 --nix-check kiln-vmd-nixos-module
+      - nix eval --raw .#devShells.x86_64-linux.default.drvPath
+      - nix eval --raw .#devShells.aarch64-linux.default.drvPath
+      - nix eval --raw .#iso.drvPath
+      - nix build .#kiln-vm .#kiln-vmd .#kiln-vm-agent .#guest-kernel --no-link
+
+  test:system:
+    desc: "Run one opt-in system test project against a local kiln-vmd (task test:system PROJECT=network)"
+    requires:
+      vars: [PROJECT]
+    dotenv:
+      - .env.systemtest
+    cmds:
+      - npx testkit run --go-project {{.PROJECT}}

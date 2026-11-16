@@ -1,0 +1,674 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: --disable-warning=DEP0040 --disable-warning=DEP0169
+  PROFILE_IMAGE_BASE_URL: https://github.com/${{ github.repository }}/releases/download
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify tag/package versions
+        run: node scripts/verify-release-version.mjs --tag="${GITHUB_REF_NAME}"
+
+      - name: Verify Debian guest kernel contract
+        run: node scripts/verify-deb-guest-kernel-contract.mjs
+
+      - name: Install Testkit
+        run: npm ci --no-audit --no-fund
+
+      - name: Default Testkit release gate
+        id: testkit
+        run: npx testkit run
+
+      - name: Nix check release gate
+        run: npx testkit run --file-timeout-seconds 3600 --nix-check kiln-vmd-nixos-module
+
+      - name: Seal interrupted Testkit results
+        if: always() && steps.testkit.outcome != 'skipped'
+        run: npx testkit cleanup
+
+      - name: Upload Testkit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testkit-results
+          path: .testkit/results
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  build:
+    name: Build binaries
+    needs:
+      - validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o dist/kiln-vm-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/kiln-vm
+          if [ "${{ matrix.goos }}" = linux ]; then
+            go build -trimpath -ldflags "-s -w" -o dist/kiln-vmd-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/kiln-vmd
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+
+  release-notices:
+    name: Prepare third-party notices
+    needs:
+      - validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare release notices
+        run: |
+          install -Dm444 third_party/github.com/miekg/dns/LICENSE dist/kiln-vm-miekg-dns.LICENSE
+          install -Dm444 third_party/golang.org/x/net/LICENSE dist/kiln-vm-golang-x-net.LICENSE
+
+      - name: Upload release notices
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notices
+          path: |
+            dist/kiln-vm-miekg-dns.LICENSE
+            dist/kiln-vm-golang-x-net.LICENSE
+
+  deb:
+    name: Build Debian package
+    needs:
+      - profile-catalog
+      - guest-kernel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Download profile image catalog
+        uses: actions/download-artifact@v4
+        with:
+          name: profile-image-catalog
+          path: dist/profile-images
+
+      - name: Download profile runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: profile-runtime-linux-${{ matrix.arch }}
+          path: dist/profile-runtime
+
+      - name: Prepare profile runtime
+        run: |
+          set -euo pipefail
+          chmod +x dist/profile-runtime/kiln-vm-agent dist/profile-runtime/kiln-vm-profile-artifact
+          go version -m dist/profile-runtime/kiln-vm-agent | grep -Eq '^[[:space:]]*path[[:space:]]+github.com/gfdelarue/kiln-vm/cmd/kiln-vm-agent$'
+          cmp -s third_party/github.com/miekg/dns/LICENSE dist/profile-runtime/third-party-notices/miekg-dns.LICENSE
+          cmp -s third_party/golang.org/x/net/LICENSE dist/profile-runtime/third-party-notices/golang-x-net.LICENSE
+
+      - name: Download guest kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-kernel-${{ matrix.arch }}
+          path: dist/guest-kernel
+
+      - name: Verify guest kernel artifact
+        run: |
+          node scripts/verify-guest-kernel-artifact.mjs \
+            --arch "${{ matrix.arch }}" \
+            --kernel dist/guest-kernel/vmlinux \
+            --metadata dist/guest-kernel/guest-kernel.json
+
+      - name: Build Debian package
+        env:
+          DEB_ARCH: ${{ matrix.arch }}
+          KILN_VM_PROFILE_IMAGE_CATALOG_SOURCE: dist/profile-images/profile-images.json
+          KILN_VM_AGENT_BIN: dist/profile-runtime/kiln-vm-agent
+          KILN_VM_KERNEL_PATH: dist/guest-kernel/vmlinux
+          KILN_VM_GUEST_KERNEL_METADATA_SOURCE: dist/guest-kernel/guest-kernel.json
+        run: node scripts/build-deb.mjs
+
+      - name: Verify embedded profile image catalog
+        run: |
+          set -euo pipefail
+          deb="dist/deb/kiln-vm_${GITHUB_REF_NAME#v}_${{ matrix.arch }}.deb"
+          mkdir -p dist/deb-check/root
+          dpkg-deb -x "$deb" dist/deb-check/root
+          test -f dist/deb-check/root/usr/share/kiln-vm/kiln-vmd.env.defaults
+          agent=dist/deb-check/root/usr/lib/kiln-vm/kiln-vm-agent
+          miekg_license=dist/deb-check/root/usr/share/doc/kiln-vm/third-party/miekg-dns.LICENSE
+          xnet_license=dist/deb-check/root/usr/share/doc/kiln-vm/third-party/golang-x-net.LICENSE
+          test -x "$agent"
+          go version -m "$agent" | grep -Eq '^[[:space:]]*path[[:space:]]+github.com/gfdelarue/kiln-vm/cmd/kiln-vm-agent$'
+          test -f "$miekg_license"
+          grep -Fqx 'BSD 3-Clause License' "$miekg_license"
+          cmp -s third_party/github.com/miekg/dns/LICENSE "$miekg_license"
+          test -f "$xnet_license"
+          grep -Fqx 'Copyright 2009 The Go Authors.' "$xnet_license"
+          cmp -s third_party/golang.org/x/net/LICENSE "$xnet_license"
+          test ! -e dist/deb-check/root/etc/kiln-vm/kiln-vmd.env
+          node scripts/verify-profile-catalog.mjs \
+            --catalog dist/deb-check/root/usr/share/kiln-vm/profile-images.json \
+            --agent-bin dist/deb-check/root/usr/lib/kiln-vm/kiln-vm-agent \
+            --fingerprint-tool dist/profile-runtime/kiln-vm-profile-artifact \
+            --arch "${{ matrix.arch }}" \
+            --required-profile alpine \
+            --required-profile ubuntu \
+            --required-profile debian \
+            --required-profile ubuntu-docker
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import crypto from "node:crypto";
+          import fs from "node:fs";
+          const arch = process.env.DEB_ARCH;
+          const root = "dist/deb-check/root";
+          const metadata = JSON.parse(fs.readFileSync(`${root}/usr/share/kiln-vm/guest-kernel.json`, "utf8"));
+          const kernel = fs.readFileSync(`${root}/usr/lib/kiln-vm/vmlinux`);
+          assert.equal(metadata.schema_version, 1);
+          assert.equal(metadata.artifact_kind, "kiln_vm_guest_kernel");
+          assert.equal(metadata.deb_arch, arch);
+          assert.equal(metadata.kernel_version, "6.1.155");
+          assert.deepEqual(metadata.config_deltas, ["CONFIG_IP_NF_RAW=y", "CONFIG_IP6_NF_RAW=y"]);
+          assert.match(metadata.release_tag, /^guest-kernel-v6\.1\.155-/);
+          assert.equal(metadata.packaged_path, "/usr/lib/kiln-vm/vmlinux");
+          assert.equal(metadata.sha256, crypto.createHash("sha256").update(kernel).digest("hex"));
+          if (arch === "arm64") assert.equal(metadata.build_output, "arch/arm64/boot/Image");
+          if (arch === "amd64") assert.equal(metadata.build_output, "vmlinux");
+          NODE
+        env:
+          DEB_ARCH: ${{ matrix.arch }}
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/deb/*.deb
+
+  guest-kernel:
+    name: Prepare guest kernel
+    needs:
+      - validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Plan guest kernel artifact
+        id: plan
+        run: |
+          mkdir -p dist/guest-kernel/cache dist/guest-kernel/run
+          node scripts/guest-kernel-artifact-plan.mjs \
+            --arch "${{ matrix.arch }}" \
+            --out dist/guest-kernel/plan.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download cached guest kernel artifact
+        id: cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          set +e
+          gh release download "${{ steps.plan.outputs.release_tag }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${{ steps.plan.outputs.artifact_name }}" \
+            --pattern "${{ steps.plan.outputs.metadata_name }}" \
+            --dir dist/guest-kernel/cache
+          status="$?"
+          set -e
+          if [ "${status}" -eq 0 ]; then
+            cp "dist/guest-kernel/cache/${{ steps.plan.outputs.artifact_name }}" dist/guest-kernel/run/vmlinux
+            cp "dist/guest-kernel/cache/${{ steps.plan.outputs.metadata_name }}" dist/guest-kernel/run/guest-kernel.json
+            node scripts/verify-guest-kernel-artifact.mjs \
+              --arch "${{ matrix.arch }}" \
+              --kernel dist/guest-kernel/run/vmlinux \
+              --metadata dist/guest-kernel/run/guest-kernel.json
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            rm -f dist/guest-kernel/cache/*
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install guest kernel build prerequisites
+        if: steps.cache.outputs.hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y bc bison build-essential flex libelf-dev libssl-dev xz-utils
+
+      - name: Build guest kernel artifact
+        if: steps.cache.outputs.hit != 'true'
+        run: |
+          node scripts/build-guest-kernel.mjs \
+            --arch "${{ matrix.arch }}" \
+            --out "dist/guest-kernel/cache/${{ steps.plan.outputs.artifact_name }}" \
+            --metadata "dist/guest-kernel/cache/${{ steps.plan.outputs.metadata_name }}"
+          node scripts/verify-guest-kernel-artifact.mjs \
+            --arch "${{ matrix.arch }}" \
+            --kernel "dist/guest-kernel/cache/${{ steps.plan.outputs.artifact_name }}" \
+            --metadata "dist/guest-kernel/cache/${{ steps.plan.outputs.metadata_name }}"
+          cp "dist/guest-kernel/cache/${{ steps.plan.outputs.artifact_name }}" dist/guest-kernel/run/vmlinux
+          cp "dist/guest-kernel/cache/${{ steps.plan.outputs.metadata_name }}" dist/guest-kernel/run/guest-kernel.json
+
+      - name: Publish guest kernel artifact cache
+        if: steps.cache.outputs.hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.plan.outputs.release_tag }}"
+          if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "kiln-vm guest kernel ${{ steps.plan.outputs.kernel_version }}" \
+              --notes "Versioned kiln-vm guest kernel artifact cache. Regenerated only when the kernel version, build recipe, architecture mapping, or config deltas change." \
+              || gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null
+          fi
+          gh release upload "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            "dist/guest-kernel/cache/${{ steps.plan.outputs.artifact_name }}" \
+            "dist/guest-kernel/cache/${{ steps.plan.outputs.metadata_name }}"
+
+      - name: Upload guest kernel artifact for this release
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-kernel-${{ matrix.arch }}
+          path: |
+            dist/guest-kernel/run/vmlinux
+            dist/guest-kernel/run/guest-kernel.json
+
+  profile-images:
+    name: Build and publish VM profile images
+    needs:
+      - validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Plan profile runtime artifact
+        id: runtime_plan
+        env:
+          PROFILE_ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist/profile-runtime/cache dist/profile-runtime
+          node scripts/profile-runtime-artifact-plan.mjs \
+            --arch "${PROFILE_ARCH}" \
+            --out dist/profile-runtime/plan.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download cached profile runtime artifact
+        id: runtime_cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          set +e
+          gh release download "${{ steps.runtime_plan.outputs.release_tag }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${{ steps.runtime_plan.outputs.metadata_name }}" \
+            --pattern "${{ steps.runtime_plan.outputs.artifact_kiln_vm_agent }}" \
+            --pattern "${{ steps.runtime_plan.outputs.artifact_kiln_vm_profile_artifact }}" \
+            --pattern "${{ steps.runtime_plan.outputs.artifact_notice_miekg_dns }}" \
+            --pattern "${{ steps.runtime_plan.outputs.artifact_notice_golang_x_net }}" \
+            --dir dist/profile-runtime/cache
+          status="$?"
+          set -e
+          if [ "${status}" -eq 0 ] && node scripts/verify-profile-runtime-artifact.mjs \
+            --arch "${{ matrix.arch }}" \
+            --artifact-dir dist/profile-runtime/cache \
+            --install-dir dist/profile-runtime; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            rm -f dist/profile-runtime/cache/*
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build profile tooling
+        if: steps.runtime_cache.outputs.hit != 'true'
+        env:
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist/profile-runtime
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -ldflags "-s -w" -o dist/profile-runtime/kiln-vm-agent ./cmd/kiln-vm-agent
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -ldflags "-s -w" -o dist/profile-runtime/kiln-vm-profile-artifact ./cmd/kiln-vm-profile-artifact
+
+      - name: Write profile runtime artifact cache
+        if: steps.runtime_cache.outputs.hit != 'true'
+        run: |
+          node scripts/write-profile-runtime-artifact.mjs \
+            --arch "${{ matrix.arch }}" \
+            --runtime-dir dist/profile-runtime \
+            --artifact-dir dist/profile-runtime/cache
+          node scripts/verify-profile-runtime-artifact.mjs \
+            --arch "${{ matrix.arch }}" \
+            --artifact-dir dist/profile-runtime/cache \
+            --install-dir dist/profile-runtime
+
+      - name: Publish profile runtime artifact cache
+        if: steps.runtime_cache.outputs.hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.runtime_plan.outputs.release_tag }}"
+          if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "kiln-vm profile runtime ${{ matrix.arch }}" \
+              --notes "Versioned kiln-vm profile runtime tooling cache. Regenerated only when Go version, target architecture, runtime source/import graph, build flags, or profile artifact recipe inputs change." \
+              || gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null
+          fi
+          gh release upload "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            dist/profile-runtime/cache/kiln-vm-profile-runtime-*
+
+      - name: Prepare profile runtime
+        run: |
+          set -euo pipefail
+          chmod +x dist/profile-runtime/kiln-vm-agent dist/profile-runtime/kiln-vm-profile-artifact
+          go version -m dist/profile-runtime/kiln-vm-agent | grep -Eq '^[[:space:]]*path[[:space:]]+github.com/gfdelarue/kiln-vm/cmd/kiln-vm-agent$'
+          cmp -s third_party/github.com/miekg/dns/LICENSE dist/profile-runtime/third-party-notices/miekg-dns.LICENSE
+          cmp -s third_party/golang.org/x/net/LICENSE dist/profile-runtime/third-party-notices/golang-x-net.LICENSE
+
+      - name: Plan VM profile image cache
+        id: plan
+        env:
+          PROFILE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/profile-images
+          node scripts/profile-image-artifact-plan.mjs \
+            --arch "${PROFILE_ARCH}" \
+            --fingerprint-tool dist/profile-runtime/kiln-vm-profile-artifact \
+            --agent-bin dist/profile-runtime/kiln-vm-agent \
+            --out dist/profile-plan.json \
+            --tsv dist/profile-plan.tsv \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download cached VM profile images
+        id: cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          patterns=()
+          while IFS=$'\t' read -r _profile _size_mb _artifact metadata; do
+            patterns+=(--pattern "${metadata}")
+          done < dist/profile-plan.tsv
+          set +e
+          gh release download "${{ steps.plan.outputs.release_tag }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir dist/profile-images \
+            "${patterns[@]}"
+          status="$?"
+          set -e
+          if [ "${status}" -eq 0 ] && node scripts/verify-profile-image-artifacts.mjs \
+            --plan dist/profile-plan.json \
+            --artifact-dir dist/profile-images \
+            --metadata-only; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            rm -f dist/profile-images/kiln-vm-profile-*
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install rootfs build prerequisites
+        if: steps.cache.outputs.hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y e2fsprogs
+
+      - name: Build VM profile image cache
+        if: steps.cache.outputs.hit != 'true'
+        env:
+          PROFILE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          arch="${PROFILE_ARCH}"
+          while IFS=$'\t' read -r profile size_mb artifact metadata; do
+            sudo -E env "PATH=$PATH" "$PWD/dist/profile-runtime/kiln-vm-profile-artifact" \
+              --profile "$profile" \
+              --rootfs-size-mb "$size_mb" \
+              --agent-bin "$PWD/dist/profile-runtime/kiln-vm-agent" \
+              --arch "$arch" \
+              --out "$PWD/dist/profile-images/$artifact" \
+              --metadata "$PWD/dist/profile-images/$metadata"
+            node scripts/stamp-profile-image-metadata.mjs \
+              --plan dist/profile-plan.json \
+              --artifact "dist/profile-images/$artifact" \
+              --metadata "dist/profile-images/$metadata"
+          done < dist/profile-plan.tsv
+          node scripts/verify-profile-image-artifacts.mjs \
+            --plan dist/profile-plan.json \
+            --artifact-dir dist/profile-images
+
+      - name: Publish VM profile image cache
+        if: steps.cache.outputs.hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.plan.outputs.release_tag }}"
+          if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "kiln-vm VM profile images ${{ matrix.arch }}" \
+              --notes "Versioned kiln-vm VM profile image cache. Regenerated only when profile recipes, guest runtime compatibility, rootfs shape, architecture, or artifact recipe changes." \
+              || gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null
+          fi
+          gh release upload "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            dist/profile-images/kiln-vm-profile-*
+
+      - name: Build profile image catalog
+        run: |
+          set -euo pipefail
+          base_url="${PROFILE_IMAGE_BASE_URL}/${{ steps.plan.outputs.release_tag }}"
+          printf '{"schema_version":1,"images":[]}\n' > dist/profile-images/profile-images.json
+          while IFS=$'\t' read -r _profile _size_mb artifact metadata; do
+            node scripts/profile-catalog-entry.mjs \
+              --metadata "dist/profile-images/$metadata" \
+              --reference "${base_url}/${artifact}" \
+              --source https \
+              --out dist/profile-images/profile-images.json
+          done < dist/profile-plan.tsv
+
+      - name: Verify profile image artifacts
+        run: |
+          base_url="${PROFILE_IMAGE_BASE_URL}/${{ steps.plan.outputs.release_tag }}"
+          node scripts/verify-profile-image-artifacts.mjs \
+            --plan dist/profile-plan.json \
+            --artifact-dir dist/profile-images \
+            --metadata-only
+          node scripts/verify-profile-catalog.mjs \
+            --catalog dist/profile-images/profile-images.json \
+            --agent-bin dist/profile-runtime/kiln-vm-agent \
+            --fingerprint-tool dist/profile-runtime/kiln-vm-profile-artifact \
+            --arch "${{ matrix.arch }}" \
+            --required-profile alpine \
+            --required-profile ubuntu \
+            --required-profile debian \
+            --required-profile ubuntu-docker
+          if [ "${{ steps.cache.outputs.hit }}" != "true" ]; then
+            node scripts/verify-profile-image-artifacts.mjs \
+              --plan dist/profile-plan.json \
+              --artifact-dir dist/profile-images
+            node scripts/verify-profile-catalog-artifacts.mjs \
+              --catalog dist/profile-images/profile-images.json \
+              --artifact-dir dist/profile-images \
+              --base-url "${base_url}"
+          fi
+
+      - name: Upload profile image catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-image-catalog-${{ matrix.arch }}
+          path: dist/profile-images/profile-images.json
+
+      - name: Upload profile runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-runtime-linux-${{ matrix.arch }}
+          path: |
+            dist/profile-runtime/kiln-vm-agent
+            dist/profile-runtime/kiln-vm-profile-artifact
+            dist/profile-runtime/third-party-notices
+
+  profile-catalog:
+    name: Merge profile image catalogs
+    needs:
+      - profile-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Download profile image catalogs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: profile-image-catalog-*
+          path: dist/profile-catalogs
+
+      - name: Merge and verify profile image catalog
+        run: |
+          set -euo pipefail
+          catalog_args=()
+          while IFS= read -r catalog; do
+            catalog_args+=(--catalog "$catalog")
+          done < <(find dist/profile-catalogs -name profile-images.json | sort)
+          node scripts/merge-profile-catalogs.mjs "${catalog_args[@]}" --out dist/profile-images/profile-images.json
+
+      - name: Upload merged profile image catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-image-catalog
+          path: dist/profile-images/profile-images.json
+
+  release:
+    name: Create release
+    needs:
+      - build
+      - deb
+      - profile-catalog
+      - release-notices
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download Debian packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download profile image catalog
+        uses: actions/download-artifact@v4
+        with:
+          name: profile-image-catalog
+          path: dist
+
+      - name: Download third-party notices
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notices
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

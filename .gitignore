@@ -1,0 +1,32 @@
+# Binaries
+/bin/
+/kiln-vmd
+/kiln-vm
+/kiln-vm-agent
+/kiln-vm-profile-artifact
+
+# Build
+/dist/
+/result
+
+# NixOS
+/result-*
+
+# Environment
+.env
+.env.local
+.env.systemtest
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testkit
+/node_modules/
+/.testkit/
