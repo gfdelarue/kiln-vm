@@ -78,7 +78,7 @@ func main() {
 	log.Printf("kiln-vm-agent listening on vsock port %d", guestagent.ForwardPort)
 	go serveForward(forwardListener)
 
-	shellListener, err := listen(guestagent.ShellPort)
+	shellListener, err := listenVsock(guestagent.ShellPort, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 	if err != nil {
 		log.Fatalf("kiln-vm-agent shell listen: %v", err)
 	}
@@ -541,7 +541,9 @@ func handleShellConn(conn net.Conn) {
 	}
 	defer ptmx.Close()
 
+	output := make(chan struct{})
 	go func() {
+		defer close(output)
 		buf := make([]byte, 4096)
 		for {
 			n, err := ptmx.Read(buf)
@@ -554,9 +556,6 @@ func handleShellConn(conn net.Conn) {
 				}
 			}
 			if err != nil {
-				if !errors.Is(err, io.EOF) {
-					closeDone()
-				}
 				return
 			}
 		}
@@ -585,6 +584,10 @@ func handleShellConn(conn net.Conn) {
 	}()
 
 	err = cmd.Wait()
+	select {
+	case <-output:
+	case <-time.After(time.Second):
+	}
 	resp := guestagent.ShellFrame{Type: "exit"}
 	if err != nil {
 		var exitErr *exec.ExitError

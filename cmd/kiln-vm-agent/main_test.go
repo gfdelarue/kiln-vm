@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -409,4 +410,52 @@ func waitForAgentMarker(t *testing.T, path string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("guest command did not create started marker %s", path)
+}
+
+func TestShellSendsExitFrameAndCloses(t *testing.T) {
+	client, agent := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		handleShellConn(agent)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		client.Close()
+		<-done
+	})
+	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	enc := json.NewEncoder(client)
+	go func() {
+		_ = enc.Encode(guestagent.ShellFrame{Type: "start", Version: guestagent.ProtocolVersion})
+		_ = enc.Encode(guestagent.ShellFrame{Type: "stdin", Data: []byte("(sleep 0.3; echo $((6*7))) & exit 7\n")})
+	}()
+	dec := json.NewDecoder(client)
+	var stdout []byte
+	for {
+		var frame guestagent.ShellFrame
+		if err := dec.Decode(&frame); err != nil {
+			t.Fatalf("no exit frame: %v", err)
+		}
+		if frame.Type == "error" {
+			t.Fatalf("shell error: %s", frame.Error)
+		}
+		if frame.Type == "stdout" {
+			stdout = append(stdout, frame.Data...)
+		}
+		if frame.Type == "exit" {
+			if frame.ExitCode != 7 {
+				t.Fatalf("exit code = %d, want 7", frame.ExitCode)
+			}
+			break
+		}
+	}
+	if !bytes.Contains(stdout, []byte("42")) {
+		t.Fatalf("exit frame came before the shell's last output; stdout = %q", stdout)
+	}
+	var extra guestagent.ShellFrame
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		t.Fatalf("after exit: frame %+v, err %v; want EOF", extra, err)
+	}
 }
