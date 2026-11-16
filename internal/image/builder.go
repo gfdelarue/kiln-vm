@@ -174,13 +174,18 @@ func prepareBuildContext(imageDir, tempParent, dockerfile, contextArchive string
 		return "", "", nil, err
 	}
 
-	dockerfilePath := filepath.Join(buildContext, "Dockerfile")
-	if err := os.WriteFile(dockerfilePath, []byte(dockerfile), 0640); err != nil {
+	root, err := os.OpenRoot(buildContext)
+	if err != nil {
 		cleanup()
-		return "", "", nil, fmt.Errorf("write Dockerfile: %w", err)
+		return "", "", nil, fmt.Errorf("open build context: %w", err)
+	}
+	defer root.Close()
+	if err := writeRootFile(root, "Dockerfile", []byte(dockerfile), 0640); err != nil {
+		cleanup()
+		return "", "", nil, err
 	}
 
-	return buildContext, dockerfilePath, cleanup, nil
+	return buildContext, filepath.Join(buildContext, "Dockerfile"), cleanup, nil
 }
 
 func unpackBase64Tar(encoded, targetDir string) error {

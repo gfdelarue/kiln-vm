@@ -105,6 +105,32 @@ func testTar(t *testing.T, headers []tar.Header) string {
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
+func TestPrepareBuildContextReplacesDockerfileSymlink(t *testing.T) {
+	hostFile := filepath.Join(t.TempDir(), "host-file")
+	if err := os.WriteFile(hostFile, []byte("host"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	archive := testTar(t, []tar.Header{{Name: "Dockerfile", Typeflag: tar.TypeSymlink, Linkname: hostFile, Mode: 0777}})
+
+	tempDir := t.TempDir()
+	_, dockerfilePath, cleanup, err := prepareBuildContext(tempDir, tempDir, "FROM scratch\n", archive)
+	if err != nil {
+		t.Fatalf("prepareBuildContext: %v", err)
+	}
+	defer cleanup()
+
+	if got, err := os.ReadFile(hostFile); err != nil || string(got) != "host" {
+		t.Fatalf("host file = %q, %v; want it untouched", got, err)
+	}
+	info, err := os.Lstat(dockerfilePath)
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("Dockerfile = %v, %v; want a regular file", info, err)
+	}
+	if got, _ := os.ReadFile(dockerfilePath); string(got) != "FROM scratch\n" {
+		t.Fatalf("Dockerfile = %q", got)
+	}
+}
+
 func TestPrepareBuildContextWritesDockerfileIntoExtractedContext(t *testing.T) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
