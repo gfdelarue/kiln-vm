@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -148,9 +149,10 @@ func TestPrepareBuildContextRejectsDockerignoreSymlinks(t *testing.T) {
 }
 
 func TestDockerBuildCommandRunsInTheBuildContext(t *testing.T) {
-	cmd := dockerBuildCommand(context.Background(), "kiln-vm-build-test:tag", "/tmp/context/Dockerfile", "/tmp/context", "")
-	if cmd.Dir != "/tmp/context" {
-		t.Fatalf("Dir = %q, want the build context", cmd.Dir)
+	cmd := dockerBuildCommand(context.Background(), "kiln-vm-build-test:tag", "relative/context", "")
+	want := []string{"docker", "build", "-t", "kiln-vm-build-test:tag", "-f", "Dockerfile", "."}
+	if cmd.Dir != "relative/context" || !slices.Equal(cmd.Args, want) {
+		t.Fatalf("Dir = %q, Args = %q; want the build context and %q", cmd.Dir, cmd.Args, want)
 	}
 }
 

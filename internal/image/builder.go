@@ -65,7 +65,7 @@ func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, con
 
 	dockerTag := fmt.Sprintf("kiln-vm-build-%s:%s", name, tag)
 
-	buildContext, dockerfilePath, cleanup, err := prepareBuildContext(stagingDir, contextParent, dockerfile, contextDir)
+	buildContext, _, cleanup, err := prepareBuildContext(stagingDir, contextParent, dockerfile, contextDir)
 	if err != nil {
 		return "", nil, err
 	}
@@ -73,7 +73,7 @@ func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, con
 
 	// docker build
 	slog.Info("building docker image", "tag", dockerTag)
-	cmd := dockerBuildCommand(ctx, dockerTag, dockerfilePath, buildContext, b.targetPlatform)
+	cmd := dockerBuildCommand(ctx, dockerTag, buildContext, b.targetPlatform)
 	output := &tailWriter{limit: dockerBuildOutputTailBytes}
 	pinned := &pinnedFromWriter{}
 	cmd.Stdout = io.MultiWriter(os.Stdout, output, pinned)
@@ -144,8 +144,8 @@ func (b *Builder) CleanupStaging() {
 }
 
 // A caller's Dockerfile.rego can read cwd:// files, so cwd must be the context.
-func dockerBuildCommand(ctx context.Context, dockerTag, dockerfilePath, buildContext, targetPlatform string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "docker", dockerBuildArgs(dockerTag, dockerfilePath, buildContext, targetPlatform)...)
+func dockerBuildCommand(ctx context.Context, dockerTag, buildContext, targetPlatform string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "docker", dockerBuildArgs(dockerTag, "Dockerfile", ".", targetPlatform)...)
 	cmd.Dir = buildContext
 	return cmd
 }
