@@ -2246,7 +2246,3 @@ func (s *recordingProfileImageService) Delete(string) error {
 func (s *recordingProfileImageService) RuntimeFingerprint() string {
 	return s.runtimeFingerprint
 }
-
-func (s *recordingProfileImageService) ResolveBaseImages(context.Context, string) map[string]string {
-	return nil
-}

@@ -80,9 +80,10 @@ Firecracker Linux profile that VMs from the image use. It defaults to `debian`.
 `--disk` defaults to the profile's disk size. kiln-vm adds its guest agent and
 init to the built filesystem, as it does for profile images. A build stops
 when the client disconnects or after `KILN_VM_IMAGE_BUILD_TIMEOUT`, which
-defaults to 30 minutes. When the base images of the Dockerfile's `FROM` lines are present
-in the host's Docker cache, the image records their repository digests in
-`resolved`.
+defaults to 30 minutes. The image's `resolved` field records the repository
+digest that each `FROM` line resolved to. kiln-vm reads the digests from the
+BuildKit output, or from the host's Docker image cache with the classic
+builder.
 
 Create a VM from an image with `--image` instead of `--profile`:
 
@@ -328,8 +329,9 @@ labels and VM images are:
 `context` is a base64-encoded tar archive. A VM image has the fields `id`,
 `name`, `profile`, `source` (`vm` or `dockerfile`), `disk_size_mb`, `labels`,
 `created_at`, and `resolved` when known. `resolved` maps each `FROM` reference
-to its repository digest. A `{ref}` is a name, an ID, or a unique ID prefix of
-at least 4 characters. Responses omit `labels` and `image` when they are empty.
+to a repository digest such as `docker.io/library/alpine@sha256:...`.
+A `{ref}` is a name, an ID, or a unique ID prefix of at least 4 characters.
+Responses omit `labels` and `image` when they are empty.
 
 Invalid labels or filters, an unknown image, and a request that sets both or
 neither of `from_vm` and `dockerfile` return `400`. Saving a VM that is not

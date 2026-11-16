@@ -127,7 +127,12 @@ func (s *vmImageImageService) Build(_ context.Context, req *models.BuildImageReq
 	if s.buildErr != nil {
 		return nil, s.buildErr
 	}
-	return s.createBacking(req.Tag, req.RootfsSizeMB)
+	img, err := s.createBacking(req.Tag, req.RootfsSizeMB)
+	if err != nil {
+		return nil, err
+	}
+	img.BaseImages = s.resolved
+	return img, nil
 }
 
 func (s *vmImageImageService) Delete(id string) error {
@@ -136,10 +141,6 @@ func (s *vmImageImageService) Delete(id string) error {
 		return fmt.Errorf("delete backing image: %w", err)
 	}
 	return nil
-}
-
-func (s *vmImageImageService) ResolveBaseImages(context.Context, string) map[string]string {
-	return s.resolved
 }
 
 type vmImageFixture struct {

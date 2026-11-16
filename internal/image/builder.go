@@ -40,25 +40,25 @@ func NewBuilder(dataDir, agentBinPath string) *Builder {
 
 // Build creates an ext4 rootfs from a Dockerfile.
 // Steps: docker build -> docker create -> sparse ext4 -> mount -> streamed docker export + extract.
-func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, contextDir string, rootfsSizeMB int64) (string, error) {
+func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, contextDir string, rootfsSizeMB int64) (string, map[string]string, error) {
 	finalDir := filepath.Join(b.dataDir, "images", imageID)
 	if err := os.MkdirAll(filepath.Dir(finalDir), 0750); err != nil {
-		return "", fmt.Errorf("create image parent dir: %w", err)
+		return "", nil, fmt.Errorf("create image parent dir: %w", err)
 	}
 	if err := checkMaterializationPreflight(b.buildDir, rootfsSizeMB, b.minFreeMB); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	buildParent := filepath.Join(b.buildDir, "images", "staging")
 	if err := os.MkdirAll(buildParent, 0750); err != nil {
-		return "", fmt.Errorf("create image staging parent: %w", err)
+		return "", nil, fmt.Errorf("create image staging parent: %w", err)
 	}
 	contextParent := filepath.Join(b.buildDir, "contexts")
 	if err := os.MkdirAll(contextParent, 0750); err != nil {
-		return "", fmt.Errorf("create image build context parent: %w", err)
+		return "", nil, fmt.Errorf("create image build context parent: %w", err)
 	}
 	stagingDir, err := os.MkdirTemp(buildParent, imageID+"-")
 	if err != nil {
-		return "", fmt.Errorf("create image staging dir: %w", err)
+		return "", nil, fmt.Errorf("create image staging dir: %w", err)
 	}
 	defer os.RemoveAll(stagingDir)
 
@@ -66,7 +66,7 @@ func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, con
 
 	buildContext, dockerfilePath, cleanup, err := prepareBuildContext(stagingDir, contextParent, dockerfile, contextDir)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer cleanup()
 
@@ -74,13 +74,14 @@ func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, con
 	slog.Info("building docker image", "tag", dockerTag)
 	cmd := exec.CommandContext(ctx, "docker", dockerBuildArgs(dockerTag, dockerfilePath, buildContext, b.targetPlatform)...)
 	output := &tailWriter{limit: dockerBuildOutputTailBytes}
-	cmd.Stdout = io.MultiWriter(os.Stdout, output)
-	cmd.Stderr = io.MultiWriter(os.Stderr, output)
+	pinned := &pinnedFromWriter{}
+	cmd.Stdout = io.MultiWriter(os.Stdout, output, pinned)
+	cmd.Stderr = io.MultiWriter(os.Stderr, output, pinned)
 	if err := cmd.Run(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", fmt.Errorf("docker build: %w", ctxErr)
+			return "", nil, fmt.Errorf("docker build: %w", ctxErr)
 		}
-		return "", &apierr.OperationError{
+		return "", nil, &apierr.OperationError{
 			Code:     "docker_build_failed",
 			Phase:    "docker_build",
 			Resource: "image",
@@ -99,27 +100,27 @@ func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, con
 	// docker create (don't start)
 	containerID, err := execOutputCtx(ctx, "docker", "create", dockerTag)
 	if err != nil {
-		return "", fmt.Errorf("docker create: %w", err)
+		return "", nil, fmt.Errorf("docker create: %w", err)
 	}
 	defer exec.Command("docker", "rm", "-f", containerID).Run()
 
 	// Materialize container rootfs into a sparse ext4 image without writing an intermediate tar.
 	stagedRootfsPath := filepath.Join(stagingDir, "rootfs.ext4")
 	if err := containerToExt4(ctx, containerID, stagedRootfsPath, rootfsSizeMB); err != nil {
-		return "", fmt.Errorf("container to ext4: %w", err)
+		return "", nil, fmt.Errorf("container to ext4: %w", err)
 	}
 
 	if err := injectRuntime(stagedRootfsPath, b.agentBinPath); err != nil {
-		return "", fmt.Errorf("inject runtime: %w", err)
+		return "", nil, fmt.Errorf("inject runtime: %w", err)
 	}
 
 	if err := promoteStagingDir(stagingDir, finalDir); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	rootfsPath := filepath.Join(finalDir, "rootfs.ext4")
 
 	slog.Info("image built", "id", imageID, "path", rootfsPath)
-	return rootfsPath, nil
+	return rootfsPath, resolveBaseImages(ctx, dockerfile, pinned.Pinned()), nil
 }
 
 func (b *Builder) SetBuildDir(buildDir string) {

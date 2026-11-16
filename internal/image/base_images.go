@@ -2,10 +2,13 @@ package image
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"os/exec"
+	"regexp"
 	"strings"
+	"sync"
 )
 
 func DockerfileBaseImages(dockerfile string) []string {
@@ -64,17 +67,49 @@ func joinDockerfileContinuations(dockerfile string) string {
 	return strings.Join(out, "\n")
 }
 
-func (s *Service) ResolveBaseImages(ctx context.Context, dockerfile string) map[string]string {
+func resolveBaseImages(ctx context.Context, dockerfile string, pinned map[string]string) map[string]string {
 	resolved := map[string]string{}
 	for _, ref := range DockerfileBaseImages(dockerfile) {
-		if digest := localRepoDigest(ctx, ref); digest != "" {
-			resolved[ref] = digest
+		name, tag, digest := canonicalImageRef(ref)
+		switch {
+		case digest != "":
+			resolved[ref] = name + "@" + digest
+		case pinned[name+":"+tag] != "":
+			resolved[ref] = name + "@" + pinned[name+":"+tag]
+		default:
+			if repoDigest := localRepoDigest(ctx, ref); repoDigest != "" {
+				resolved[ref] = repoDigest
+			}
 		}
 	}
 	if len(resolved) == 0 {
 		return nil
 	}
 	return resolved
+}
+
+func canonicalImageRef(ref string) (name, tag, digest string) {
+	name = ref
+	if i := strings.Index(name, "@"); i >= 0 {
+		name, digest = name[:i], name[i+1:]
+	}
+	if i := strings.LastIndex(name, ":"); i > strings.LastIndex(name, "/") {
+		name, tag = name[:i], name[i+1:]
+	}
+	if tag == "" {
+		tag = "latest"
+	}
+	domain, rest, found := strings.Cut(name, "/")
+	if !found || (!strings.ContainsAny(domain, ".:") && domain != "localhost") {
+		domain, rest = "docker.io", name
+	}
+	if domain == "index.docker.io" {
+		domain = "docker.io"
+	}
+	if domain == "docker.io" && !strings.Contains(rest, "/") {
+		rest = "library/" + rest
+	}
+	return domain + "/" + rest, tag, digest
 }
 
 func localRepoDigest(ctx context.Context, ref string) string {
@@ -86,5 +121,59 @@ func localRepoDigest(ctx context.Context, ref string) string {
 	if err := json.Unmarshal(out, &digests); err != nil || len(digests) == 0 {
 		return ""
 	}
-	return digests[0]
+	name, _, digest := canonicalImageRef(digests[0])
+	if digest == "" {
+		return ""
+	}
+	return name + "@" + digest
+}
+
+var buildKitPinnedFromPattern = regexp.MustCompile(`^#\d+ \[[^\]]*\] FROM (\S+)@(sha256:[0-9a-f]{64})$`)
+
+const pinnedFromLineLimit = 64 * 1024
+
+type pinnedFromWriter struct {
+	mu      sync.Mutex
+	partial []byte
+	pinned  map[string]string
+}
+
+func (w *pinnedFromWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.partial = append(w.partial, p...)
+	for {
+		i := bytes.IndexByte(w.partial, '\n')
+		if i < 0 {
+			break
+		}
+		w.scanLine(w.partial[:i])
+		w.partial = w.partial[i+1:]
+	}
+	if len(w.partial) > pinnedFromLineLimit {
+		w.partial = nil
+	}
+	return len(p), nil
+}
+
+func (w *pinnedFromWriter) scanLine(line []byte) {
+	match := buildKitPinnedFromPattern.FindSubmatch(bytes.TrimSpace(line))
+	if match == nil {
+		return
+	}
+	name, tag, _ := canonicalImageRef(string(match[1]))
+	if w.pinned == nil {
+		w.pinned = map[string]string{}
+	}
+	w.pinned[name+":"+tag] = string(match[2])
+}
+
+func (w *pinnedFromWriter) Pinned() map[string]string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.partial) > 0 {
+		w.scanLine(w.partial)
+		w.partial = nil
+	}
+	return w.pinned
 }

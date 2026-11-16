@@ -133,7 +133,7 @@ func (s *Service) Build(ctx context.Context, req *models.BuildImageRequest) (*mo
 		defer cancel()
 	}
 
-	rootfsPath, err := s.builder.Build(ctx, id, req.Name, tag, req.Dockerfile, req.Context, rootfsSizeMB)
+	rootfsPath, baseImages, err := s.builder.Build(ctx, id, req.Name, tag, req.Dockerfile, req.Context, rootfsSizeMB)
 	if err != nil {
 		os.RemoveAll(imageDir)
 		return nil, fmt.Errorf("build image: %w", err)
@@ -153,6 +153,7 @@ func (s *Service) Build(ctx context.Context, req *models.BuildImageRequest) (*mo
 		SizeMB:     info.Size() / (1024 * 1024),
 		RootfsPath: rootfsPath,
 		CreatedAt:  time.Now().UTC(),
+		BaseImages: baseImages,
 	}
 
 	if err := s.db.CreateImage(img); err != nil {

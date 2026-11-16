@@ -167,7 +167,7 @@ func (s *Service) buildVMImage(ctx context.Context, name string, req *models.Cre
 		ImageID:    img.ID,
 		DiskSizeMB: diskSizeMB,
 		Labels:     normalizeLabels(req.Labels),
-		Resolved:   s.images.ResolveBaseImages(ctx, req.Dockerfile),
+		Resolved:   img.BaseImages,
 		CreatedAt:  time.Now().UTC(),
 	})
 }

@@ -64,7 +64,6 @@ type ImageService interface {
 	Get(id string) (*models.Image, error)
 	Delete(id string) error
 	RuntimeFingerprint() string
-	ResolveBaseImages(ctx context.Context, dockerfile string) map[string]string
 }
 
 type Service struct {
