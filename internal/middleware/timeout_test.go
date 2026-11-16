@@ -124,3 +124,25 @@ func TestTimeoutExceptStreamingPreservesVMForwardSessions(t *testing.T) {
 		}
 	}
 }
+
+func TestTimeoutExceptStreamingPreservesVMImageCreation(t *testing.T) {
+	for _, tc := range []struct {
+		method       string
+		path         string
+		wantDeadline bool
+	}{
+		{http.MethodPost, "/vm-images", false},
+		{http.MethodGet, "/vm-images", true},
+		{http.MethodDelete, "/vm-images/env", true},
+	} {
+		var hasDeadline bool
+		handler := TimeoutExceptStreaming(time.Minute)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, hasDeadline = r.Context().Deadline()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(tc.method, tc.path, nil))
+		if hasDeadline != tc.wantDeadline {
+			t.Errorf("%s %s deadline = %t, want %t", tc.method, tc.path, hasDeadline, tc.wantDeadline)
+		}
+	}
+}

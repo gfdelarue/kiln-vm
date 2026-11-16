@@ -2056,6 +2056,10 @@ func (s *roleCreateMachineService) DialShell(context.Context, string) (io.ReadWr
 	panic("not used")
 }
 
+func (s *roleCreateMachineService) RootDiskPath(string) (string, error) {
+	return "", errors.New("root disk path should not be called")
+}
+
 func (s *roleCreateMachineService) DialForward(context.Context, string, int) (io.ReadWriteCloser, error) {
 	panic("not used")
 }
@@ -2124,6 +2128,10 @@ func (s *powerMachineService) DialShell(context.Context, string) (io.ReadWriteCl
 	panic("not used")
 }
 
+func (s *powerMachineService) RootDiskPath(string) (string, error) {
+	return "", errors.New("root disk path should not be called")
+}
+
 func (s *powerMachineService) DialForward(context.Context, string, int) (io.ReadWriteCloser, error) {
 	panic("not used")
 }
@@ -2182,6 +2190,10 @@ func (s *readinessMachineService) DialShell(context.Context, string) (io.ReadWri
 	panic("not used")
 }
 
+func (s *readinessMachineService) RootDiskPath(string) (string, error) {
+	return "", errors.New("root disk path should not be called")
+}
+
 func (s *readinessMachineService) DialForward(_ context.Context, _ string, port int) (io.ReadWriteCloser, error) {
 	s.forwardPorts = append(s.forwardPorts, port)
 	client, server := net.Pipe()
@@ -2233,4 +2245,8 @@ func (s *recordingProfileImageService) Delete(string) error {
 
 func (s *recordingProfileImageService) RuntimeFingerprint() string {
 	return s.runtimeFingerprint
+}
+
+func (s *recordingProfileImageService) ResolveBaseImages(context.Context, string) map[string]string {
+	return nil
 }

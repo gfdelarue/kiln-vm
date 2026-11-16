@@ -31,6 +31,7 @@ func isLongRunning(r *http.Request) bool {
 		strings.EqualFold(r.Header.Get("Upgrade"), "websocket"),
 		path == "/vms",
 		path == "/vm-profile-images/ensure",
+		path == "/vm-images" && r.Method == http.MethodPost,
 		strings.HasPrefix(path, "/vm-profiles/") && strings.HasSuffix(path, "/prepare"):
 		return true
 	}

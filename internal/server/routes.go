@@ -42,6 +42,10 @@ func registerRoutes(r chi.Router, authService *auth.Service, vmService *vmservic
 		r.Post("/vm-profile-images/ensure", vmHandler.EnsureProfileImage)
 		r.Delete("/vm-profile-images/{id}", vmHandler.DeleteProfileImage)
 		r.Delete("/vm-profile-images/profile/{profile}", vmHandler.DeleteProfileImagesByProfile)
+		r.Post("/vm-images", vmHandler.CreateImage)
+		r.Get("/vm-images", vmHandler.ListImages)
+		r.Get("/vm-images/{ref}", vmHandler.GetImage)
+		r.Delete("/vm-images/{ref}", vmHandler.DeleteImage)
 
 		r.Post("/vms/plan", vmHandler.PlanCreate)
 		r.Post("/vms", vmHandler.Create)

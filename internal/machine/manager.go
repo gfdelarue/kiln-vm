@@ -23,6 +23,7 @@ import (
 	"github.com/gfdelarue/kiln-vm/internal/execution"
 	"github.com/gfdelarue/kiln-vm/internal/guestagent"
 	"github.com/gfdelarue/kiln-vm/internal/hostfs"
+	imagepkg "github.com/gfdelarue/kiln-vm/internal/image"
 	"github.com/gfdelarue/kiln-vm/internal/models"
 	"github.com/gfdelarue/kiln-vm/internal/refid"
 )
@@ -472,6 +473,12 @@ func (m *Manager) Create(ctx context.Context, req *models.CreateMachineRequest) 
 		_ = os.RemoveAll(machineDir)
 		return nil, fmt.Errorf("copy rootfs: %w", err)
 	}
+	if req.RootfsSizeMB > 0 {
+		if err := imagepkg.EnsureRootfsSize(ctx, dstRootfs, req.RootfsSizeMB); err != nil {
+			_ = os.RemoveAll(machineDir)
+			return nil, fmt.Errorf("grow rootfs: %w", err)
+		}
+	}
 
 	alloc, persisted, err := m.commitAndActivatePublicNetwork(machine, plannedAllocation, true)
 	if err != nil {
@@ -578,6 +585,17 @@ func renderResolvConf(servers []string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+func (m *Manager) RootDiskPath(id string) (string, error) {
+	machine, err := m.getMachine(id)
+	if err != nil {
+		return "", err
+	}
+	if isLibvirtMachine(machine) {
+		return "", &apierr.ValidationError{Field: "from_vm", Message: "saving a libvirt-qemu VM disk is not supported; only Firecracker VMs can be saved as images"}
+	}
+	return filepath.Join(m.cfg.DataDir, "machines", machine.ID, "rootfs.ext4"), nil
 }
 
 func (m *Manager) getMachine(id string) (*models.Machine, error) {

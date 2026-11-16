@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -372,6 +373,10 @@ func (s *recordingVMMachineService) Upload(_ context.Context, id, remotePath str
 
 func (s *recordingVMMachineService) DialShell(context.Context, string) (io.ReadWriteCloser, error) {
 	return nil, fmt.Errorf("unexpected DialShell")
+}
+
+func (s *recordingVMMachineService) RootDiskPath(string) (string, error) {
+	return "", errors.New("root disk path should not be called")
 }
 
 func (s *recordingVMMachineService) DialForward(_ context.Context, id string, port int) (io.ReadWriteCloser, error) {

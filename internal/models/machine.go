@@ -83,6 +83,7 @@ type CreateMachineRequest struct {
 	CPU           *CPUConfig         `json:"cpu,omitempty"`
 	VCPUs         int                `json:"-"`
 	MemoryMB      int                `json:"memory_mb"`
+	RootfsSizeMB  int64              `json:"rootfs_size_mb,omitempty"`
 }
 
 type CPUConfig struct {

@@ -12,7 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"github.com/gfdelarue/kiln-vm/internal/apierr"
 	thirdparty "github.com/gfdelarue/kiln-vm/third_party"
 )
 
@@ -71,10 +73,26 @@ func (b *Builder) Build(ctx context.Context, imageID, name, tag, dockerfile, con
 	// docker build
 	slog.Info("building docker image", "tag", dockerTag)
 	cmd := exec.CommandContext(ctx, "docker", dockerBuildArgs(dockerTag, dockerfilePath, buildContext, b.targetPlatform)...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	output := &tailWriter{limit: dockerBuildOutputTailBytes}
+	cmd.Stdout = io.MultiWriter(os.Stdout, output)
+	cmd.Stderr = io.MultiWriter(os.Stderr, output)
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("docker build: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("docker build: %w", ctxErr)
+		}
+		return "", &apierr.OperationError{
+			Code:     "docker_build_failed",
+			Phase:    "docker_build",
+			Resource: "image",
+			Action:   "build",
+			Diagnostics: []apierr.OperationDiagnostic{{
+				Category:    "docker_build",
+				Step:        "docker build",
+				StderrTail:  output.String(),
+				Remediation: "fix the Dockerfile or build context and retry",
+			}},
+			Err: fmt.Errorf("docker build: %w", err),
+		}
 	}
 	defer exec.Command("docker", "image", "rm", "-f", dockerTag).Run()
 
@@ -441,4 +459,28 @@ func execOutputCtx(ctx context.Context, name string, args ...string) (string, er
 		s = s[:len(s)-1]
 	}
 	return s, nil
+}
+
+const dockerBuildOutputTailBytes = 8 * 1024
+
+type tailWriter struct {
+	mu    sync.Mutex
+	limit int
+	buf   []byte
+}
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.limit {
+		w.buf = append(w.buf[:0], w.buf[len(w.buf)-w.limit:]...)
+	}
+	return len(p), nil
+}
+
+func (w *tailWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
 }

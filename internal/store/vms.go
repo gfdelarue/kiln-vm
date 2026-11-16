@@ -10,15 +10,19 @@ import (
 
 func (db *DB) CreateVM(vm *models.VMRecord) error {
 	vm.Power.Policy = defaultStorePowerPolicy(vm.Power.Policy)
-	_, err := db.Exec(`
+	labelsJSON, err := encodeLabels(vm.Labels)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`
 		INSERT INTO vms (
-			id, name, profile, machine_id, image_id, disk_size_mb,
+			id, name, profile, machine_id, image_id, vm_image, labels_json, disk_size_mb,
 			power_mode, power_idle_timeout_seconds,
 			power_last_activity_at, power_last_started_at, power_last_stopped_at, power_stop_reason,
 			created_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		vm.ID, vm.Name, vm.Profile, vm.MachineID, vm.ImageID, vm.DiskSizeMB,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		vm.ID, vm.Name, vm.Profile, vm.MachineID, vm.ImageID, vm.VMImage, labelsJSON, vm.DiskSizeMB,
 		vm.Power.Policy.Mode, vm.Power.Policy.IdleTimeoutSeconds,
 		vm.Power.LastActivityAt, vm.Power.LastStartedAt, vm.Power.LastStoppedAt, vm.Power.StopReason,
 		vm.CreatedAt, vm.UpdatedAt,
@@ -31,7 +35,7 @@ func (db *DB) CreateVM(vm *models.VMRecord) error {
 
 func (db *DB) GetVM(ref string) (*models.VMRecord, error) {
 	vm, err := scanVMRow(db.QueryRow(`
-		SELECT id, name, profile, machine_id, image_id, disk_size_mb,
+		SELECT id, name, profile, machine_id, image_id, vm_image, labels_json, disk_size_mb,
 			power_mode, power_idle_timeout_seconds,
 			power_last_activity_at, power_last_started_at, power_last_stopped_at, power_stop_reason,
 			created_at, updated_at
@@ -45,7 +49,7 @@ func (db *DB) GetVM(ref string) (*models.VMRecord, error) {
 
 func (db *DB) GetVMByMachineID(machineID string) (*models.VMRecord, error) {
 	vm, err := scanVMRow(db.QueryRow(`
-		SELECT id, name, profile, machine_id, image_id, disk_size_mb,
+		SELECT id, name, profile, machine_id, image_id, vm_image, labels_json, disk_size_mb,
 			power_mode, power_idle_timeout_seconds,
 			power_last_activity_at, power_last_started_at, power_last_stopped_at, power_stop_reason,
 			created_at, updated_at
@@ -59,7 +63,7 @@ func (db *DB) GetVMByMachineID(machineID string) (*models.VMRecord, error) {
 
 func (db *DB) ListVMs() ([]models.VMRecord, error) {
 	rows, err := db.Query(`
-		SELECT id, name, profile, machine_id, image_id, disk_size_mb,
+		SELECT id, name, profile, machine_id, image_id, vm_image, labels_json, disk_size_mb,
 			power_mode, power_idle_timeout_seconds,
 			power_last_activity_at, power_last_started_at, power_last_stopped_at, power_stop_reason,
 			created_at, updated_at
@@ -85,7 +89,7 @@ func (db *DB) ListVMs() ([]models.VMRecord, error) {
 
 func (db *DB) ListPowerStartVMs() ([]models.VMRecord, error) {
 	rows, err := db.Query(`
-		SELECT v.id, v.name, v.profile, v.machine_id, v.image_id, v.disk_size_mb,
+		SELECT v.id, v.name, v.profile, v.machine_id, v.image_id, v.vm_image, v.labels_json, v.disk_size_mb,
 			v.power_mode, v.power_idle_timeout_seconds,
 			v.power_last_activity_at, v.power_last_started_at, v.power_last_stopped_at, v.power_stop_reason,
 			v.created_at, v.updated_at
@@ -289,12 +293,15 @@ func scanVMRow(row scanner) (*models.VMRecord, error) {
 	var lastActivityAt sql.NullTime
 	var lastStartedAt sql.NullTime
 	var lastStoppedAt sql.NullTime
+	var labelsJSON string
 	if err := row.Scan(
 		&vm.ID,
 		&vm.Name,
 		&vm.Profile,
 		&vm.MachineID,
 		&vm.ImageID,
+		&vm.VMImage,
+		&labelsJSON,
 		&vm.DiskSizeMB,
 		&mode,
 		&vm.Power.Policy.IdleTimeoutSeconds,
@@ -307,6 +314,11 @@ func scanVMRow(row scanner) (*models.VMRecord, error) {
 	); err != nil {
 		return nil, fmt.Errorf("scan vm: %w", err)
 	}
+	labels, err := decodeLabels(labelsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("scan vm: %w", err)
+	}
+	vm.Labels = labels
 	vm.Power.Policy.Mode = models.VMPowerMode(mode)
 	vm.Power.LastActivityAt = nullTimePtr(lastActivityAt)
 	vm.Power.LastStartedAt = nullTimePtr(lastStartedAt)

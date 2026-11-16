@@ -61,6 +61,8 @@ CREATE TABLE vms (
 	profile TEXT NOT NULL,
 	machine_id TEXT NOT NULL UNIQUE REFERENCES machines(id) ON DELETE CASCADE,
 	image_id TEXT NOT NULL REFERENCES images(id),
+	vm_image TEXT NOT NULL DEFAULT '',
+	labels_json TEXT NOT NULL DEFAULT '{}',
 	disk_size_mb INTEGER NOT NULL,
 	power_mode TEXT NOT NULL DEFAULT 'manual',
 	power_idle_timeout_seconds INTEGER NOT NULL DEFAULT 0,
@@ -80,6 +82,18 @@ CREATE TABLE vm_profile_images (
 	rootfs_size_mb INTEGER NOT NULL,
 	created_at DATETIME NOT NULL,
 	UNIQUE(profile, fingerprint, rootfs_size_mb)
+);
+
+CREATE TABLE vm_images (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE,
+	profile TEXT NOT NULL,
+	source TEXT NOT NULL,
+	image_id TEXT NOT NULL UNIQUE REFERENCES images(id),
+	disk_size_mb INTEGER NOT NULL,
+	labels_json TEXT NOT NULL DEFAULT '{}',
+	resolved_json TEXT NOT NULL DEFAULT '{}',
+	created_at DATETIME NOT NULL
 );
 
 CREATE TABLE vm_capability_conditions (

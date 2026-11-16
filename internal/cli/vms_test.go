@@ -134,6 +134,8 @@ func TestVMCreatePlanOutputShowsResolvedShape(t *testing.T) {
 func newVMCreateParseTestCommand() *cobra.Command {
 	cmd := &cobra.Command{}
 	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("image", "", "")
+	cmd.Flags().StringArray("label", nil, "")
 	cmd.Flags().String("disk", "", "")
 	cmd.Flags().String("network-policy", "", "")
 	cmd.Flags().String("cpu", "", "")
