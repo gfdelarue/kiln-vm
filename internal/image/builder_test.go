@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,6 +40,69 @@ func TestUnpackBase64TarRejectsPathTraversal(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected traversal error, got nil")
 	}
+}
+
+func TestUnpackBase64TarRejectsNestedPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "context")
+	if err := os.MkdirAll(target, 0750); err != nil {
+		t.Fatal(err)
+	}
+	archive := testTar(t, []tar.Header{{Name: "../outside/file", Typeflag: tar.TypeReg, Mode: 0600}})
+	if err := unpackBase64Tar(archive, target); err == nil {
+		t.Fatal("expected traversal error, got nil")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "outside")); !os.IsNotExist(err) {
+		t.Fatalf("extraction escaped the context: %v", err)
+	}
+}
+
+func TestUnpackBase64TarKeepsSymlinksButNotWritesThroughThem(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "context")
+	if err := os.MkdirAll(target, 0750); err != nil {
+		t.Fatal(err)
+	}
+	archive := testTar(t, []tar.Header{
+		{Name: "app.txt", Typeflag: tar.TypeReg, Mode: 0600},
+		{Name: "alias", Typeflag: tar.TypeSymlink, Linkname: "app.txt"},
+	})
+	if err := unpackBase64Tar(archive, target); err != nil {
+		t.Fatalf("unpackBase64Tar: %v", err)
+	}
+	if link, err := os.Readlink(filepath.Join(target, "alias")); err != nil || link != "app.txt" {
+		t.Fatalf("alias = %q, %v; want a symlink to app.txt", link, err)
+	}
+
+	escape := filepath.Join(dir, "escape")
+	if err := os.MkdirAll(escape, 0750); err != nil {
+		t.Fatal(err)
+	}
+	archive = testTar(t, []tar.Header{
+		{Name: "up", Typeflag: tar.TypeSymlink, Linkname: escape},
+		{Name: "up/file", Typeflag: tar.TypeReg, Mode: 0600},
+	})
+	if err := unpackBase64Tar(archive, target); err == nil {
+		t.Fatal("expected an error writing through a symlink out of the context")
+	}
+	if entries, _ := os.ReadDir(escape); len(entries) != 0 {
+		t.Fatalf("extraction wrote %d entries outside the context", len(entries))
+	}
+}
+
+func testTar(t *testing.T, headers []tar.Header) string {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, header := range headers {
+		if err := tw.WriteHeader(&header); err != nil {
+			t.Fatalf("WriteHeader: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
 func TestPrepareBuildContextWritesDockerfileIntoExtractedContext(t *testing.T) {
@@ -108,15 +172,9 @@ func TestRuntimeFingerprintChangesWithCompatibilityVersion(t *testing.T) {
 	}
 }
 
-func TestInjectAgentBinaryIncludesExactGoXNetNotice(t *testing.T) {
+func TestWriteRuntimeIncludesExactGoXNetNotice(t *testing.T) {
 	mountDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(mountDir, "sbin"), 0755); err != nil {
-		t.Fatalf("MkdirAll(sbin): %v", err)
-	}
-	agentPath := filepath.Join(t.TempDir(), "kiln-vm-agent")
-	if err := os.WriteFile(agentPath, []byte("agent-binary"), 0755); err != nil {
-		t.Fatalf("WriteFile(kiln-vm-agent): %v", err)
-	}
+	agentPath := writeTestAgent(t)
 	licensePath := filepath.Join(mountDir, filepath.FromSlash(thirdparty.GoXNetGuestLicensePath))
 	if err := os.MkdirAll(filepath.Dir(licensePath), 0755); err != nil {
 		t.Fatalf("MkdirAll(notice): %v", err)
@@ -125,8 +183,8 @@ func TestInjectAgentBinaryIncludesExactGoXNetNotice(t *testing.T) {
 		t.Fatalf("WriteFile(stale notice): %v", err)
 	}
 
-	if err := injectAgentBinary(mountDir, agentPath); err != nil {
-		t.Fatalf("injectAgentBinary: %v", err)
+	if err := writeRuntime(openTestRoot(t, mountDir), agentPath); err != nil {
+		t.Fatalf("writeRuntime: %v", err)
 	}
 
 	got, err := os.ReadFile(licensePath)
@@ -143,6 +201,112 @@ func TestInjectAgentBinaryIncludesExactGoXNetNotice(t *testing.T) {
 	if got, want := info.Mode().Perm(), os.FileMode(0444); got != want {
 		t.Fatalf("notice mode = %o, want %o", got, want)
 	}
+}
+
+func TestWriteRuntimeReplacesSymlinksInsteadOfFollowingThem(t *testing.T) {
+	dir := t.TempDir()
+	hostFile := filepath.Join(dir, "host-file")
+	if err := os.WriteFile(hostFile, []byte("host"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mountDir := filepath.Join(dir, "rootfs")
+	if err := os.MkdirAll(filepath.Join(mountDir, "sbin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(hostFile, filepath.Join(mountDir, "sbin", "kiln-vm-init")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../host-file", filepath.Join(mountDir, "sbin", "kiln-vm-agent")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeRuntime(openTestRoot(t, mountDir), writeTestAgent(t)); err != nil {
+		t.Fatalf("writeRuntime: %v", err)
+	}
+
+	if got, _ := os.ReadFile(hostFile); string(got) != "host" {
+		t.Fatalf("host file = %q, want it untouched", got)
+	}
+	for _, name := range []string{"kiln-vm-init", "kiln-vm-agent"} {
+		info, err := os.Lstat(filepath.Join(mountDir, "sbin", name))
+		if err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("sbin/%s: info %v, err %v; want a regular file", name, info, err)
+		}
+	}
+}
+
+func TestWriteRuntimeRejectsDirectorySymlinksOutOfTheRootfs(t *testing.T) {
+	dir := t.TempDir()
+	hostDir := filepath.Join(dir, "host-dir")
+	if err := os.MkdirAll(hostDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	mountDir := filepath.Join(dir, "rootfs")
+	if err := os.MkdirAll(mountDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(hostDir, filepath.Join(mountDir, "sbin")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeRuntime(openTestRoot(t, mountDir), writeTestAgent(t)); err == nil {
+		t.Fatal("writeRuntime followed sbin out of the rootfs")
+	}
+	if entries, _ := os.ReadDir(hostDir); len(entries) != 0 {
+		t.Fatalf("host dir has %d entries, want none", len(entries))
+	}
+}
+
+func TestEnsureOpenSSHHostKeysAddsMissingPairsOnly(t *testing.T) {
+	if _, err := exec.LookPath("ssh-keygen"); err != nil {
+		t.Skip("ssh-keygen is not installed")
+	}
+	mountDir := t.TempDir()
+	for _, name := range []string{"usr/sbin/sshd", "usr/bin/ssh-keygen", "etc/ssh/ssh_host_rsa_key"} {
+		path := filepath.Join(mountDir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("guest"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := ensureOpenSSHHostKeys(openTestRoot(t, mountDir)); err != nil {
+		t.Fatalf("ensureOpenSSHHostKeys: %v", err)
+	}
+
+	sshDir := filepath.Join(mountDir, "etc", "ssh")
+	if got, _ := os.ReadFile(filepath.Join(sshDir, "ssh_host_rsa_key")); string(got) != "guest" {
+		t.Fatalf("existing rsa key = %q, want it kept", got)
+	}
+	if _, err := os.Stat(filepath.Join(sshDir, "ssh_host_rsa_key.pub")); !os.IsNotExist(err) {
+		t.Fatalf("rsa public key was added next to the guest's own private key: %v", err)
+	}
+	for _, name := range []string{"ssh_host_ed25519_key", "ssh_host_ed25519_key.pub"} {
+		if _, err := os.Stat(filepath.Join(sshDir, name)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+func writeTestAgent(t *testing.T) string {
+	t.Helper()
+	agentPath := filepath.Join(t.TempDir(), "kiln-vm-agent")
+	if err := os.WriteFile(agentPath, []byte("agent-binary"), 0755); err != nil {
+		t.Fatalf("WriteFile(kiln-vm-agent): %v", err)
+	}
+	return agentPath
+}
+
+func openTestRoot(t *testing.T, dir string) *os.Root {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { root.Close() })
+	return root
 }
 
 func TestDockerBuildArgsIncludeTargetPlatformWhenProvided(t *testing.T) {

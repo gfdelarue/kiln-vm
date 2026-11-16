@@ -83,7 +83,8 @@ when the client disconnects or after `KILN_VM_IMAGE_BUILD_TIMEOUT`, which
 defaults to 30 minutes. The image's `resolved` field records the repository
 digest that each `FROM` line resolved to. kiln-vm reads the digests from the
 BuildKit output, or from the host's Docker image cache with the classic
-builder.
+builder. A `FROM` line that uses a build argument, such as `FROM ${BASE}`,
+gets no entry.
 
 Create a VM from an image with `--image` instead of `--profile`:
 
@@ -93,8 +94,8 @@ kiln-vm create big --image tools --disk 64G
 ```
 
 The VM uses the image's profile. Its disk defaults to the image's size and
-cannot be smaller. `kiln-vm list` and `kiln-vm get` show the image a VM came
-from.
+cannot be smaller. `kiln-vm list --json` and `kiln-vm get --json` show the
+image a VM came from.
 
 `kiln-vm vm-images delete` always removes the image from the list. Each VM has
 its own copy of the disk, so VMs created from the image keep working. kiln-vm

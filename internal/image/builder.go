@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -187,6 +188,11 @@ func unpackBase64Tar(encoded, targetDir string) error {
 	if err != nil {
 		return fmt.Errorf("decode build context: %w", err)
 	}
+	root, err := os.OpenRoot(targetDir)
+	if err != nil {
+		return fmt.Errorf("open build context: %w", err)
+	}
+	defer root.Close()
 
 	tr := tar.NewReader(bytes.NewReader(data))
 	for {
@@ -198,21 +204,28 @@ func unpackBase64Tar(encoded, targetDir string) error {
 			return fmt.Errorf("read build context: %w", err)
 		}
 
-		targetPath := filepath.Join(targetDir, filepath.Clean(header.Name))
-		if !isWithin(targetDir, targetPath) {
+		name := filepath.Clean(header.Name)
+		if !filepath.IsLocal(name) {
 			return fmt.Errorf("invalid build context path: %s", header.Name)
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(targetPath, 0750); err != nil {
+			if err := root.MkdirAll(name, 0750); err != nil {
 				return fmt.Errorf("create context dir: %w", err)
 			}
-		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0750); err != nil {
+		case tar.TypeSymlink:
+			if err := root.MkdirAll(filepath.Dir(name), 0750); err != nil {
 				return fmt.Errorf("create context parent dir: %w", err)
 			}
-			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode))
+			if err := root.Symlink(header.Linkname, name); err != nil {
+				return fmt.Errorf("create context symlink: %w", err)
+			}
+		case tar.TypeReg:
+			if err := root.MkdirAll(filepath.Dir(name), 0750); err != nil {
+				return fmt.Errorf("create context parent dir: %w", err)
+			}
+			f, err := root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
 			if err != nil {
 				return fmt.Errorf("create context file: %w", err)
 			}
@@ -225,14 +238,6 @@ func unpackBase64Tar(encoded, targetDir string) error {
 			}
 		}
 	}
-}
-
-func isWithin(root, path string) bool {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && filepath.Dir(rel) != ".."
 }
 
 func containerToExt4(ctx context.Context, containerID, ext4Path string, sizeMB int64) error {
@@ -284,75 +289,124 @@ func injectRuntime(rootfsPath, agentBinPath string) error {
 	mountDir := rootfsPath + ".mount"
 	os.MkdirAll(mountDir, 0750)
 
-	if out, err := exec.Command("mount", "-o", "loop", rootfsPath, mountDir).CombinedOutput(); err != nil {
+	if out, err := exec.Command("mount", "-o", "loop,nodev,nosuid,noexec", rootfsPath, mountDir).CombinedOutput(); err != nil {
 		return fmt.Errorf("mount: %s: %w", out, err)
 	}
 	defer cleanupMountedRootfsDir(mountDir, rootfsPath)
 
-	if err := os.MkdirAll(filepath.Join(mountDir, "sbin"), 0755); err != nil {
-		return fmt.Errorf("create sbin dir: %w", err)
+	root, err := os.OpenRoot(mountDir)
+	if err != nil {
+		return fmt.Errorf("open rootfs: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(mountDir, "sbin", "kiln-vm-init"), []byte(initScript), 0755); err != nil {
-		return fmt.Errorf("write kiln-vm-init: %w", err)
-	}
-
-	if err := injectAgentBinary(mountDir, agentBinPath); err != nil {
-		return err
-	}
-
-	if err := ensureOpenSSHHostKeys(mountDir); err != nil {
-		return err
-	}
-
-	return nil
+	defer root.Close()
+	return writeRuntime(root, agentBinPath)
 }
 
-func injectAgentBinary(mountDir, agentBinPath string) error {
+func writeRuntime(root *os.Root, agentBinPath string) error {
 	if agentBinPath == "" {
 		return fmt.Errorf("kiln-vm agent path is not configured")
 	}
-
 	agentBytes, err := os.ReadFile(agentBinPath)
 	if err != nil {
 		return fmt.Errorf("read kiln-vm-agent binary: %w", err)
 	}
 
-	targetPath := filepath.Join(mountDir, "sbin", "kiln-vm-agent")
-	if err := os.WriteFile(targetPath, agentBytes, 0755); err != nil {
+	if err := root.MkdirAll("sbin", 0755); err != nil {
+		return fmt.Errorf("create sbin dir: %w", err)
+	}
+	if err := writeRootFile(root, "sbin/kiln-vm-init", []byte(initScript), 0755); err != nil {
+		return fmt.Errorf("write kiln-vm-init: %w", err)
+	}
+	if err := writeRootFile(root, "sbin/kiln-vm-agent", agentBytes, 0755); err != nil {
 		return fmt.Errorf("write kiln-vm-agent: %w", err)
 	}
 
-	licensePath := filepath.Join(mountDir, filepath.FromSlash(thirdparty.GoXNetGuestLicensePath))
-	if err := os.MkdirAll(filepath.Dir(licensePath), 0755); err != nil {
+	licensePath := thirdparty.GoXNetGuestLicensePath
+	if err := root.MkdirAll(path.Dir(licensePath), 0755); err != nil {
 		return fmt.Errorf("create kiln-vm-agent third-party notice dir: %w", err)
 	}
-	if err := os.WriteFile(licensePath, thirdparty.GoXNetLicense(), 0444); err != nil {
+	if err := writeRootFile(root, licensePath, thirdparty.GoXNetLicense(), 0444); err != nil {
 		return fmt.Errorf("write kiln-vm-agent golang.org/x/net notice: %w", err)
 	}
-	if err := os.Chmod(licensePath, 0444); err != nil {
+	if err := root.Chmod(licensePath, 0444); err != nil {
 		return fmt.Errorf("set kiln-vm-agent golang.org/x/net notice permissions: %w", err)
+	}
+
+	return ensureOpenSSHHostKeys(root)
+}
+
+func writeRootFile(root *os.Root, name string, data []byte, perm os.FileMode) error {
+	info, err := root.Lstat(name)
+	if err == nil && !info.Mode().IsRegular() {
+		if err := root.Remove(name); err != nil {
+			return fmt.Errorf("replace %s: %w", info.Mode().Type(), err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+	if err := root.WriteFile(name, data, perm); err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
 	}
 	return nil
 }
 
-func ensureOpenSSHHostKeys(mountDir string) error {
-	sshdPath := filepath.Join(mountDir, "usr", "sbin", "sshd")
-	sshKeygenPath := filepath.Join(mountDir, "usr", "bin", "ssh-keygen")
-	if _, err := os.Stat(sshdPath); err != nil {
+func ensureOpenSSHHostKeys(root *os.Root) error {
+	if _, err := root.Stat("usr/sbin/sshd"); err != nil {
 		return nil
 	}
-	if _, err := os.Stat(sshKeygenPath); err != nil {
+	if _, err := root.Stat("usr/bin/ssh-keygen"); err != nil {
 		return nil
 	}
 
-	if err := os.MkdirAll(filepath.Join(mountDir, "etc", "ssh"), 0755); err != nil {
-		return fmt.Errorf("create ssh config dir: %w", err)
+	scratch, err := os.MkdirTemp("", "kiln-vm-ssh-host-keys-*")
+	if err != nil {
+		return fmt.Errorf("create ssh host key dir: %w", err)
 	}
-
-	if out, err := exec.Command("ssh-keygen", "-A", "-f", mountDir).CombinedOutput(); err != nil {
+	defer os.RemoveAll(scratch)
+	keyDir := filepath.Join(scratch, "etc", "ssh")
+	if err := os.MkdirAll(keyDir, 0755); err != nil {
+		return fmt.Errorf("create ssh host key dir: %w", err)
+	}
+	if out, err := exec.Command("ssh-keygen", "-A", "-f", scratch).CombinedOutput(); err != nil {
 		return fmt.Errorf("generate openssh host keys: %s: %w", out, err)
 	}
+
+	if err := root.MkdirAll("etc/ssh", 0755); err != nil {
+		return fmt.Errorf("create ssh config dir: %w", err)
+	}
+	keys, err := os.ReadDir(keyDir)
+	if err != nil {
+		return fmt.Errorf("read generated ssh host keys: %w", err)
+	}
+	for _, key := range keys {
+		private := key.Name()
+		if strings.HasSuffix(private, ".pub") {
+			continue
+		}
+		if _, err := root.Lstat("etc/ssh/" + private); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect ssh host key: %w", err)
+		}
+		for _, name := range []string{private, private + ".pub"} {
+			if err := copyIntoRoot(root, filepath.Join(keyDir, name), "etc/ssh/"+name); err != nil {
+				return fmt.Errorf("install ssh host key: %w", err)
+			}
+		}
+	}
 	return nil
+}
+
+func copyIntoRoot(root *os.Root, src, name string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", src, err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", src, err)
+	}
+	return writeRootFile(root, name, data, info.Mode().Perm())
 }
 
 const initScript = `#!/bin/sh
